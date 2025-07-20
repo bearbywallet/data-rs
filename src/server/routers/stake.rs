@@ -8,22 +8,6 @@ use hyper::{
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
-enum StakingPoolType {
-    LIQUID,
-    NORMAL,
-}
-
-#[derive(Debug, Serialize)]
-struct EvmPool<'a> {
-    address: &'a str,
-    token_address: &'a str,
-    name: &'a str,
-    pool_type: StakingPoolType,
-    token_decimals: u8,
-    token_symbol: &'a str,
-}
-
-#[derive(Debug, Serialize)]
 struct Token<'a> {
     pub name: &'a str,
     pub symbol: &'a str,
@@ -41,174 +25,51 @@ struct EvmPoolV2<'a> {
     can_stake: bool,
 }
 
-const MAINNET_POOLS: [EvmPool; 11] = [
-    EvmPool {
-        address: "0x1f0e86Bc299Cc66df2e5512a7786C3F528C0b5b6",
-        token_address: "0x8a2afD8Fe79F8C694210eB71f4d726Fc8cAFdB31",
-        name: "Amazing Pool (Avely)",
-        pool_type: StakingPoolType::LIQUID,
-        token_decimals: 18,
-        token_symbol: "aZIL",
-    },
-    EvmPool {
-        address: "0x1311059DD836D7000Dc673eA4Cc834fe04e9933C",
-        token_address: "0x8E3073b22F670d3A09C66D0Abb863f9E358402d2",
-        name: "Encapsulate",
-        pool_type: StakingPoolType::LIQUID,
-        token_decimals: 18,
-        token_symbol: "encapZIL",
-    },
-    EvmPool {
-        address: "0x18925cE668b2bBC26dfE6F630F5C285D46b937AE",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "CEX.IO",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0x8776F1135b3583DbaE79C8f7268a7e0d4C16462c",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "DTEAM",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0x63CE81C023Bb9F8A6FFA08fcF48ba885C21FcFBC",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "Luganodes",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0x715F94264057df97e772ebDFE2c94A356244F142",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "Stakefish",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0xBD6ca237f30A86eea8CF9bF869677F3a0496a990",
-        token_address: "0x3B78f66651E2eCAbf13977817848F82927a17DcF",
-        name: "Lithium Digital",
-        pool_type: StakingPoolType::LIQUID,
-        token_decimals: 18,
-        token_symbol: "litZil",
-    },
-    EvmPool {
-        address: "0xCDb0B23Db1439b28689844FD093C478d73C0786A",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "2ZilMoon (Make Zilliqa Great Again)",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0x068C599686d2511AD709B8b4C578549A65D19491",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "AlphaZil (former Ezil)",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0xF35E17333Bd4AD7b11e18f750AFbccE14e4101b7",
-        token_address: "0x0000000000000000000000000000000000000000",
-        name: "Moonlet",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "ZIL",
-    },
-    EvmPool {
-        address: "0x691682FCa60Fa6B702a0a69F60d045c08f404220",
-        token_address: "0xc85b0db68467dede96A7087F4d4C47731555cA7A",
-        name: "PlunderSwap Staked ZIL",
-        pool_type: StakingPoolType::NORMAL,
-        token_decimals: 18,
-        token_symbol: "pZIL",
-    },
-];
-
-pub async fn handle_get_pools(
-    _req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let json = serde_json::to_string(&MAINNET_POOLS).unwrap_or_else(|e| {
-        eprintln!("Error serializing pools: {}", e);
-        "[]".to_string()
-    });
-
-    let mut response = Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(json)))
-        .unwrap();
-
-    response
-        .headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    response.headers_mut().insert(
-        ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET"),
-    );
-
-    Ok(response)
-}
-
-const MAINNET_POOLS_V2: [EvmPoolV2; 12] = [
+const MAINNET_POOLS_V2: [EvmPoolV2; 21] = [
     EvmPoolV2 {
-        address: "0x1f0e86Bc299Cc66df2e5512a7786C3F528C0b5b6",
+        address: "0x1f0e86bc299cc66df2e5512a7786c3f528c0b5b6",
         name: "ZilPay Pool (Avely)",
         token: Some(Token {
             name: "Amazing Pool Liquid Staking",
             symbol: "aZIL",
             decimals: 18,
-            address: "0x8a2afD8Fe79F8C694210eB71f4d726Fc8cAFdB31",
+            address: "0x8a2afd8fe79f8c694210eb71f4d726fc8cafdb31",
         }),
         hide: false,
-        uptime: 99,
+        uptime: 100,
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0xCDb0B23Db1439b28689844FD093C478d73C0786A",
+        address: "0xcdb0b23db1439b28689844fd093c478d73c0786a",
         name: "2ZilMoon (Make Zilliqa Great Again)",
         token: None,
         hide: false,
-        uptime: 99,
+        uptime: 100,
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x068C599686d2511AD709B8b4C578549A65D19491",
+        address: "0x068c599686d2511ad709b8b4c578549a65d19491",
         name: "AlphaZil (former Ezil)",
         token: None,
         hide: false,
-        uptime: 99,
+        uptime: 100,
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x1311059DD836D7000Dc673eA4Cc834fe04e9933C",
+        address: "0x1311059dd836d7000dc673ea4cc834fe04e9933c",
         name: "Encapsulate",
         token: Some(Token {
             name: "Encapsulate Zilliqa",
             symbol: "encapZIL",
             decimals: 18,
-            address: "0x8E3073b22F670d3A09C66D0Abb863f9E358402d2",
+            address: "0x8e3073b22f670d3a09c66d0abb863f9e358402d2",
         }),
         hide: false,
         uptime: 99,
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x18925cE668b2bBC26dfE6F630F5C285D46b937AE",
-        name: "CEX.IO",
-        token: None,
-        hide: false,
-        uptime: 99,
-        can_stake: true,
-    },
-    EvmPoolV2 {
-        address: "0x8776F1135b3583DbaE79C8f7268a7e0d4C16462c",
+        address: "0x8776f1135b3583dbae79c8f7268a7e0d4c16462c",
         name: "DTEAM",
         token: None,
         hide: false,
@@ -216,7 +77,7 @@ const MAINNET_POOLS_V2: [EvmPoolV2; 12] = [
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x63CE81C023Bb9F8A6FFA08fcF48ba885C21FcFBC",
+        address: "0x63ce81c023bb9f8a6ffa08fcf48ba885c21fcfbc",
         name: "Luganodes",
         token: None,
         hide: false,
@@ -224,7 +85,7 @@ const MAINNET_POOLS_V2: [EvmPoolV2; 12] = [
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x715F94264057df97e772ebDFE2c94A356244F142",
+        address: "0x715f94264057df97e772ebdfe2c94a356244f142",
         name: "Stakefish",
         token: None,
         hide: false,
@@ -232,20 +93,20 @@ const MAINNET_POOLS_V2: [EvmPoolV2; 12] = [
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0xBD6ca237f30A86eea8CF9bF869677F3a0496a990",
+        address: "0xbd6ca237f30a86eea8cf9bf869677f3a0496a990",
         name: "Lithium Digital",
         token: Some(Token {
             name: "litZil",
             symbol: "litZil",
             decimals: 18,
-            address: "0x3B78f66651E2eCAbf13977817848F82927a17DcF",
+            address: "0x3b78f66651e2ecabf13977817848f82927a17dcf",
         }),
         hide: false,
         uptime: 99,
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0xF35E17333Bd4AD7b11e18f750AFbccE14e4101b7",
+        address: "0xf35e17333bd4ad7b11e18f750afbcce14e4101b7",
         name: "Moonlet",
         token: None,
         hide: false,
@@ -253,30 +114,115 @@ const MAINNET_POOLS_V2: [EvmPoolV2; 12] = [
         can_stake: true,
     },
     EvmPoolV2 {
-        address: "0x691682FCa60Fa6B702a0a69F60d045c08f404220",
+        address: "0x691682fca60fa6b702a0a69f60d045c08f404220",
         name: "PlunderSwap",
         token: Some(Token {
             name: "PlunderSwap Staked ZIL",
             symbol: "pZIL",
             decimals: 18,
-            address: "0xc85b0db68467dede96A7087F4d4C47731555cA7A",
+            address: "0xc85b0db68467dede96a7087f4d4c47731555ca7a",
         }),
         hide: false,
-        uptime: 80,
+        uptime: 100,
         can_stake: false,
     },
     EvmPoolV2 {
-        address: "0xBB2Cb8B573Ec1ec4f77953128df7F1d08D9c34DF",
+        address: "0xbb2cb8b573ec1ec4f77953128df7f1d08d9c34df",
         name: "TorchWallet.io",
         token: Some(Token {
             name: "Torch Liquid ZIL",
             symbol: "tZIL",
             decimals: 18,
-            address: "0x9e4E0F7A06E50DA13c78cF8C83E907f792DE54fd",
+            address: "0x9e4e0f7a06e50da13c78cf8c83e907f792de54fd",
         }),
         hide: false,
         uptime: 99,
         can_stake: false,
+    },
+    EvmPoolV2 {
+        address: "0x87297b0b63a0b93d3f7cafa9e0f4c849e92642eb",
+        name: "BlackNodes",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0xe5e8158883a37449ae07fe70b69e658766b317fc",
+        name: "Shardpool",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0x7e3a0aebbf8ec2f12a8a885cd663ee4a490f923f",
+        name: "Zillet Staking Pool",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0xf7f4049e7472fc32805aae5bcce909419a34d254",
+        name: "StakeShark",
+        token: Some(Token {
+            name: "StakeShark Staked ZIL",
+            symbol: "shZIL",
+            decimals: 18,
+            address: "0x737ebf814d2c14fb21e00fd2990afc364c2af506",
+        }),
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0xd12340c2d5a26e7f5c469b57ee81ee82c8cb7686",
+        name: "Citadel.one",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0x18925ce668b2bbc26dfe6f630f5c285d46b937ae",
+        name: "CEX.IO",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0xe67e119dcdc1168ec8089f4647702a72a0fcbc7f",
+        name: "PathrockNetwork",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0x26322705fcbf5d3065707c408b6594912daa3488",
+        name: "Cryptech-Hacken",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0x60571e6c6d55109e6705d17956201a0cf39f1198",
+        name: "RockX",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
+    },
+    EvmPoolV2 {
+        address: "0xba669cc6b49218624e84920dc8136a05411b1ec8",
+        name: "Stakin",
+        token: None,
+        hide: false,
+        uptime: 99,
+        can_stake: true,
     },
 ];
 

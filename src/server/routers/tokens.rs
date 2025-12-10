@@ -26,20 +26,58 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "poolAddress": "0x1f0e86Bc299Cc66df2e5512a7786C3F528C0b5b6"
         },
         {
-            "address": "0x9e4E0F7A06E50DA13c78cF8C83E907f792DE54fd",
-            "name": "Torch Liquid ZIL",
-            "symbol": "tZIL",
-            "decimals": 18,
-            "poolName": "TorchWallet.io",
-            "poolAddress": "0xBB2Cb8B573Ec1ec4f77953128df7F1d08D9c34DF"
+            "address": "0x17D5af5658A24bd964984b36d28e879a8626adC3",
+            "name": "Zilliqa-bridged ETH token",
+            "symbol": "zETH",
+            "decimals": 18
         },
         {
-            "address": "0xc85b0db68467dede96A7087F4d4C47731555cA7A",
-            "name": "PlunderSwap Staked ZIL",
-            "symbol": "pZIL",
-            "decimals": 18,
-            "poolName": "PlunderSwap",
-            "poolAddress": "0x691682FCa60Fa6B702a0a69F60d045c08f404220"
+            "address": "0xea87bC6CcaE73bae35693639e22eF30667760F61",
+            "name": "Zilliqa-bridged BNB Coin",
+            "symbol": "zBNB",
+            "decimals": 18
+        },
+        {
+            "address": "0x2274005778063684fbB1BfA96a2b725dC37D75f9",
+            "name": "Zilliqa-bridged USDT token",
+            "symbol": "zUSDT",
+            "decimals": 6
+        },
+        {
+            "address": "0x2938fF251Aecc1dfa768D7d0276eB6d073690317",
+            "name": "Zilliqa-bridged WBTC token",
+            "symbol": "zWBTC",
+            "decimals": 8
+        },
+        {
+            "address": "0x4345472A0c6164F35808CDb7e7eCCd3d326CC50b",
+            "name": "Zilliqa-bridged MATIC Token",
+            "symbol": "zMATIC",
+            "decimals": 18
+        },
+        {
+            "address": "0x8DEAdC20f7218994c86b59eE1D5c7979fFcAa893",
+            "name": "Zilliqa-bridged OPUL token",
+            "symbol": "zOPUL",
+            "decimals": 18
+        },
+        {
+            "address": "0xD819257C964A78A493DF93D5643E9490b54C5af2",
+            "name": "Zilliqa-bridged BRKL token",
+            "symbol": "zBRKL",
+            "decimals": 18
+        },
+        {
+            "address": "0x9121A67cA79B6778eAb477c5F76dF6de7C79cC4b",
+            "name": "Zilliqa-bridged TRAXX token",
+            "symbol": "zTRAXX",
+            "decimals": 18
+        },
+        {
+            "address": "0x097C26F8A93009fd9d98561384b5014D64ae17C2",
+            "name": "StZIL",
+            "symbol": "stZIL",
+            "decimals": 12
         },
         {
             "address": "0x8E3073b22F670d3A09C66D0Abb863f9E358402d2",
@@ -66,12 +104,6 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "poolAddress": "0xF7F4049e7472fC32805Aae5bcCE909419a34D254"
         },
         {
-            "address": "0xe64cA52EF34FdD7e20C0c7fb2E392cc9b4F6D049",
-            "name": "Kalijo",
-            "symbol": "SEED",
-            "decimals": 18
-        },
-        {
             "address": "0x63B991C17010C21250a0eA58C6697F696a48cdf3",
             "name": "The Winners Circle",
             "symbol": "HRSE",
@@ -84,28 +116,10 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "decimals": 12
         },
         {
-            "address": "0x2274005778063684fbB1BfA96a2b725dC37D75f9",
-            "name": "Zilliqa-bridged USDT token",
-            "symbol": "zUSDT",
-            "decimals": 6
-        },
-        {
             "address": "0x598FbD8B68a8B7e75b8B7182c750164f348907Bc",
             "name": "XSGD",
             "symbol": "XSGD",
             "decimals": 6
-        },
-        {
-            "address": "0x2938fF251Aecc1dfa768D7d0276eB6d073690317",
-            "name": "Zilliqa-bridged WBTC token",
-            "symbol": "zWBTC",
-            "decimals": 8
-        },
-        {
-            "address": "0x17D5af5658A24bd964984b36d28e879a8626adC3",
-            "name": "Zilliqa-bridged ETH token",
-            "symbol": "zETH",
-            "decimals": 18
         },
         {
             "address": "0xCcF3Ea256d42Aeef0EE0e39Bfc94bAa9Fa14b0Ba",
@@ -138,12 +152,6 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "decimals": 15
         },
         {
-            "address": "0x097C26F8A93009fd9d98561384b5014D64ae17C2",
-            "name": "StZIL",
-            "symbol": "stZIL",
-            "decimals": 12
-        },
-        {
             "address": "0x01035e423c40a9ad4F6be2E6cC014EB5617c8Bd6",
             "name": "Zoge Coin",
             "symbol": "ZOGE",
@@ -168,16 +176,18 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "decimals": 4
         },
         {
-            "address": "0xD819257C964A78A493DF93D5643E9490b54C5af2",
-            "name": "Zilliqa-bridged BRKL token",
-            "symbol": "zBRKL",
-            "decimals": 18
-        },
-        {
             "address": "0xa0A5795e7eccc43Ba92d2A0b7804696F8B9e1a05",
             "name": "dXCAD Token",
             "symbol": "dXCAD",
             "decimals": 18
+        },
+        {
+            "address": "0xc85b0db68467dede96A7087F4d4C47731555cA7A",
+            "name": "PlunderSwap Staked ZIL",
+            "symbol": "pZIL",
+            "decimals": 18,
+            "poolName": "PlunderSwap",
+            "poolAddress": "0x691682FCa60Fa6B702a0a69F60d045c08f404220"
         },
         {
             "address": "0x1202078D298Ff0358A95b6fbf48Ec166dB414660",
@@ -186,33 +196,15 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "decimals": 4
         },
         {
-            "address": "0x9121A67cA79B6778eAb477c5F76dF6de7C79cC4b",
-            "name": "Zilliqa-bridged TRAXX token",
-            "symbol": "zTRAXX",
-            "decimals": 18
-        },
-        {
             "address": "0xc99ECB82a27B45592eA02ACe9e3C42050f3c00C0",
             "name": "UNIFEES",
             "symbol": "FEES",
             "decimals": 4
         },
         {
-            "address": "0x4345472A0c6164F35808CDb7e7eCCd3d326CC50b",
-            "name": "Zilliqa-bridged MATIC Token",
-            "symbol": "zMATIC",
-            "decimals": 18
-        },
-        {
-            "address": "0xea87bC6CcaE73bae35693639e22eF30667760F61",
-            "name": "Zilliqa-bridged BNB Coin",
-            "symbol": "zBNB",
-            "decimals": 18
-        },
-        {
-            "address": "0x8DEAdC20f7218994c86b59eE1D5c7979fFcAa893",
-            "name": "Zilliqa-bridged OPUL token",
-            "symbol": "zOPUL",
+            "address": "0xe64cA52EF34FdD7e20C0c7fb2E392cc9b4F6D049",
+            "name": "Kalijo",
+            "symbol": "SEED",
             "decimals": 18
         }
     ]);

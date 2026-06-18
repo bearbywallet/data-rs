@@ -26,6 +26,12 @@ pub async fn hanlde_get_evm_tokens() -> Result<Response<Full<Bytes>>, hyper::Err
             "poolAddress": "0x1f0e86Bc299Cc66df2e5512a7786C3F528C0b5b6"
         },
         {
+            "address": "0x94e18aE7dd5eE57B55f30c4B63E2760c09EFb192",
+            "name": "Wrapped ZIL",
+            "symbol": "WZIL",
+            "decimals": 18
+        },
+        {
             "address": "0x17D5af5658A24bd964984b36d28e879a8626adC3",
             "name": "Zilliqa-bridged ETH token",
             "symbol": "zETH",

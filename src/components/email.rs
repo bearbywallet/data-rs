@@ -1,6 +1,6 @@
 use lettre::{
     message::{header::ContentType, Mailbox},
-    transport::smtp::authentication::Credentials,
+    transport::smtp::authentication::{Credentials, Mechanism},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use log::{error, info};
@@ -47,7 +47,11 @@ impl Emailer {
         let builder = if user.is_empty() {
             builder
         } else {
-            builder.credentials(Credentials::new(user, pass))
+            // OpenSMTPD rejects AUTH PLAIN with an initial response (501
+            // Syntax error); the step-by-step LOGIN exchange works.
+            builder
+                .credentials(Credentials::new(user, pass))
+                .authentication(vec![Mechanism::Login])
         };
 
         info!("SMTP: enabled {}:{}", host, port);

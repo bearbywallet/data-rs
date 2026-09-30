@@ -1,5 +1,6 @@
 use data_rs::{
-    models::{currencies::Currencies, dex::Dex, meta::Meta},
+    components::email::Emailer,
+    models::{currencies::Currencies, dex::Dex, meta::Meta, waitlist::Waitlist},
     server::run_server,
     utils::zilliqa::Zilliqa,
 };
@@ -26,6 +27,8 @@ async fn main() {
     let meta = Arc::new(RwLock::new(Meta::new(&db_path)));
     let rates = Arc::new(RwLock::new(Currencies::new(&db_path)));
     let dex = Arc::new(RwLock::new(Dex::new(&db_path)));
+    let waitlist = Arc::new(Waitlist::new(&db_path));
+    let emailer = Arc::new(Emailer::new());
 
     let meta_ref = Arc::clone(&meta);
     let dex_ref = Arc::clone(&dex);
@@ -108,7 +111,14 @@ async fn main() {
     let dex_ref0 = Arc::clone(&dex);
     let rates_ref0 = Arc::clone(&rates);
 
-    run_server(&meta_ref0, &dex_ref0, &rates_ref0, port)
-        .await
-        .unwrap();
+    run_server(
+        &meta_ref0,
+        &dex_ref0,
+        &rates_ref0,
+        &waitlist,
+        &emailer,
+        port,
+    )
+    .await
+    .unwrap();
 }

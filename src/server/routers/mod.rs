@@ -5,20 +5,37 @@ use hyper::{Request, Response};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::models::{currencies::Currencies, dex::Dex, meta::Meta};
+use crate::components::email::Emailer;
+use crate::models::{currencies::Currencies, dex::Dex, meta::Meta, waitlist::Waitlist};
 
 mod dex;
 mod rates;
 mod stake;
 mod tokens;
+mod waitlist;
 
 pub async fn route(
     req: Request<hyper::body::Incoming>,
     meta: Arc<RwLock<Meta>>,
     dex: Arc<RwLock<Dex>>,
     rates: Arc<RwLock<Currencies>>,
+    waitlist: Arc<Waitlist>,
+    emailer: Arc<Emailer>,
+    peer: String,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
+        (&hyper::Method::OPTIONS, path) if path.starts_with("/api/v1/waitlist") => {
+            waitlist::handle_preflight().await
+        }
+        (&hyper::Method::POST, "/api/v1/waitlist") => {
+            waitlist::handle_join(req, waitlist, emailer, peer).await
+        }
+        (&hyper::Method::GET, "/api/v1/waitlist/unsubscribe") => {
+            waitlist::handle_unsubscribe(req, waitlist).await
+        }
+        (&hyper::Method::GET, "/api/v1/waitlist/stats") => {
+            waitlist::handle_stats(req, waitlist).await
+        }
         (&hyper::Method::GET, "/api/v1/dex") => dex::handle_get_pools(req, meta, dex, rates).await,
         (&hyper::Method::GET, "/api/v1/rates") => rates::handle_get_rates(req, rates).await,
         (&hyper::Method::GET, "/api/v2/stake/pools") => stake::handle_get_poolsv2(req).await,

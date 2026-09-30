@@ -83,9 +83,19 @@ pub async fn handle_join(
     emailer: Arc<Emailer>,
     peer: String,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let ip: IpAddr = peer
-        .parse()
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    // Direct socket peer; behind relayd it is 127.0.0.1 — then take the real
+    // client from X-Forwarded-For (relayd injects it via $REMOTE_ADDR).
+    let socket_ip: IpAddr = peer.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let ip: IpAddr = if socket_ip.is_loopback() {
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|xff| xff.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(socket_ip)
+    } else {
+        socket_ip
+    };
 
     if waitlist.rate_limit(ip).is_err() {
         return json_res(
@@ -122,7 +132,7 @@ pub async fn handle_join(
     }
 
     // Same "ok" for every post-pow outcome: no email enumeration.
-    let status = waitlist.join(&email, peer);
+    let status = waitlist.join(&email, ip.to_string());
 
     if status != JoinStatus::Cooldown {
         let base =

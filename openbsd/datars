@@ -1,0 +1,15 @@
+#!/bin/ksh
+
+daemon="/usr/bearby_projects/data-rs/target/release/data-rs"
+daemon_user="bearby"
+rc_reload="NO"
+
+. /etc/rc.d/rc.subr
+
+rc_start() {
+    # All secrets live in /etc/data-rs.env (root:bearby 640).
+    # WAITLIST_SECRET is required — the daemon exits without it.
+    rc_exec "set -a; . /etc/data-rs.env; ${daemon} >> /var/log/data-rs.log 2>&1 &"
+}
+
+rc_cmd $1

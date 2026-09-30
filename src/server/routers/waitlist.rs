@@ -1,4 +1,4 @@
-use crate::models::waitlist::{normalize_email, valid_email, JoinStatus, Waitlist};
+use crate::models::waitlist::{normalize_email, valid_email, ConfirmStatus, Waitlist};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header, Request, Response, StatusCode};
@@ -132,22 +132,68 @@ pub async fn handle_join(
     }
 
     // Same "ok" for every post-pow outcome: no email enumeration.
-    let status = waitlist.join(&email, ip.to_string());
+    let (status, code) = waitlist.join(&email, ip.to_string());
 
-    if status != JoinStatus::Cooldown {
-        let base =
-            std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "https://api.bearby.io".to_string());
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("email", &email)
-            .append_pair("token", &waitlist.token(&email))
-            .finish();
-
-        emailer
-            .send_welcome(&email, &format!("{}/api/v1/waitlist/unsubscribe?{}", base, query))
-            .await;
+    if !code.is_empty() {
+        emailer.send_code(&email, &code).await;
     }
 
+    let _ = status;
+
     json_res(StatusCode::OK, json!({ "code": 0, "message": "ok" }))
+}
+
+pub async fn handle_confirm(
+    req: Request<hyper::body::Incoming>,
+    waitlist: Arc<Waitlist>,
+    emailer: Arc<Emailer>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let query = req.uri().query().unwrap_or_default();
+    let pairs: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let email = normalize_email(pairs.get("email").map(String::as_str).unwrap_or_default());
+    let code = pairs.get("code").map(String::as_str).unwrap_or_default().trim();
+
+    if !valid_email(&email) || code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return incorrect_params();
+    }
+
+    let status = waitlist.confirm(&email, code);
+
+    match status {
+        ConfirmStatus::Confirmed => {
+            let base =
+                std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "https://api.zilpay.ru".to_string());
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("email", &email)
+                .append_pair("token", &waitlist.token(&email))
+                .finish();
+
+            emailer
+                .send_welcome(&email, &format!("{}/api/v1/waitlist/unsubscribe?{}", base, query))
+                .await;
+
+            json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
+        }
+        ConfirmStatus::AlreadyConfirmed => {
+            json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
+        }
+        ConfirmStatus::WrongCode => json_res(
+            StatusCode::FORBIDDEN,
+            json!({ "code": -7, "message": "Wrong code" }),
+        ),
+        ConfirmStatus::Expired => json_res(
+            StatusCode::GONE,
+            json!({ "code": -8, "message": "Code expired" }),
+        ),
+        ConfirmStatus::TooManyAttempts => json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -9, "message": "Too many attempts" }),
+        ),
+        ConfirmStatus::NotFound => incorrect_params(),
+    }
 }
 
 pub async fn handle_unsubscribe(

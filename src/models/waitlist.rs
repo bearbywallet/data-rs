@@ -1,6 +1,6 @@
 use crate::config::waitlist::{
-    WAITLIST_EMAIL_COOLDOWN_SECS, WAITLIST_KEY, WAITLIST_POW_DIFFICULTY,
-    WAITLIST_RATE_LIMIT_MAX, WAITLIST_RATE_LIMIT_WINDOW_SECS,
+    WAITLIST_CODE_MAX_ATTEMPTS, WAITLIST_CODE_TTL_SECS, WAITLIST_EMAIL_COOLDOWN_SECS,
+    WAITLIST_KEY, WAITLIST_POW_DIFFICULTY, WAITLIST_RATE_LIMIT_MAX, WAITLIST_RATE_LIMIT_WINDOW_SECS,
 };
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,14 @@ pub struct Subscriber {
     pub ip: String,
     pub unsubscribed: bool,
     pub last_email: u64,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub code_expires: u64,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,6 +38,16 @@ pub enum JoinStatus {
     Resubscribed,
     Already,
     Cooldown,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ConfirmStatus {
+    Confirmed,
+    AlreadyConfirmed,
+    WrongCode,
+    Expired,
+    TooManyAttempts,
+    NotFound,
 }
 
 pub struct Waitlist {
@@ -116,7 +134,23 @@ impl Waitlist {
         Ok(())
     }
 
-    pub fn join(&self, email: &str, ip: String) -> JoinStatus {
+    /// Random-enough 6 digit code: secret + email + clock nanos through sha256.
+    fn gen_code(&self, email: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let digest = Sha256::digest(format!("{}|{}|{}", self.secret, email, nanos).as_bytes());
+        let n = u64::from_be_bytes([
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+        ]) % 1_000_000;
+
+        format!("{:06}", n)
+    }
+
+    /// Start/resume a subscription: (re)generate the confirmation code and email it.
+    /// Returns (status, code) — code is empty when nothing was sent (cooldown / already confirmed).
+    pub fn join(&self, email: &str, ip: String) -> (JoinStatus, String) {
         let ts = now();
 
         match self.db.get(email) {
@@ -127,35 +161,95 @@ impl Waitlist {
                     ip,
                     unsubscribed: false,
                     last_email: 0,
+                    confirmed: false,
+                    code: String::new(),
+                    code_expires: 0,
+                    attempts: 0,
                 });
 
-                if sub.unsubscribed {
-                    sub.unsubscribed = false;
-                    sub.last_email = ts;
-                    let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
-                    return JoinStatus::Resubscribed;
+                if sub.confirmed && !sub.unsubscribed {
+                    return (JoinStatus::Already, String::new());
                 }
 
-                if ts.saturating_sub(sub.last_email) < WAITLIST_EMAIL_COOLDOWN_SECS {
-                    return JoinStatus::Cooldown;
+                if ts.saturating_sub(sub.last_email) < WAITLIST_EMAIL_COOLDOWN_SECS
+                    && !sub.unsubscribed
+                {
+                    return (JoinStatus::Cooldown, String::new());
                 }
 
+                let code = self.gen_code(email);
+                sub.unsubscribed = false;
+                sub.confirmed = false;
                 sub.last_email = ts;
+                sub.code = code.clone();
+                sub.code_expires = ts + WAITLIST_CODE_TTL_SECS;
+                sub.attempts = 0;
+
+                let status = if sub.id == 0 {
+                    sub.id = (self.db.len() + 1) as u64;
+                    JoinStatus::Created
+                } else {
+                    JoinStatus::Resubscribed
+                };
+
                 let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
-                JoinStatus::Already
+                (status, code)
             }
             _ => {
+                let code = self.gen_code(email);
                 let sub = Subscriber {
                     id: (self.db.len() + 1) as u64,
                     ts,
                     ip,
                     unsubscribed: false,
                     last_email: ts,
+                    confirmed: false,
+                    code: code.clone(),
+                    code_expires: ts + WAITLIST_CODE_TTL_SECS,
+                    attempts: 0,
                 };
                 let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
-                JoinStatus::Created
+                (JoinStatus::Created, code)
             }
         }
+    }
+
+    /// Verify the emailed code. Only the mailbox owner can pass.
+    pub fn confirm(&self, email: &str, code: &str) -> ConfirmStatus {
+        let bytes = match self.db.get(email) {
+            Ok(Some(b)) => b,
+            _ => return ConfirmStatus::NotFound,
+        };
+        let mut sub: Subscriber = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(_) => return ConfirmStatus::NotFound,
+        };
+
+        if sub.confirmed {
+            return ConfirmStatus::AlreadyConfirmed;
+        }
+
+        let ts = now();
+
+        if ts > sub.code_expires {
+            return ConfirmStatus::Expired;
+        }
+
+        if sub.attempts >= WAITLIST_CODE_MAX_ATTEMPTS {
+            return ConfirmStatus::TooManyAttempts;
+        }
+
+        sub.attempts += 1;
+
+        if sub.code != code {
+            let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
+            return ConfirmStatus::WrongCode;
+        }
+
+        sub.confirmed = true;
+        sub.code.clear();
+        let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
+        ConfirmStatus::Confirmed
     }
 
     pub fn unsubscribe(&self, email: &str) {
@@ -176,12 +270,15 @@ impl Waitlist {
     }
 
     pub fn stats(&self) -> serde_json::Value {
-        let (mut total, mut unsubscribed, mut last7d) = (0u64, 0u64, 0u64);
+        let (mut total, mut confirmed, mut unsubscribed, mut last7d) = (0u64, 0u64, 0u64, 0u64);
         let week_ago = now() - 7 * 24 * 3600;
 
         for entry in self.db.iter().flatten() {
             if let Ok(sub) = serde_json::from_slice::<Subscriber>(&entry.1) {
                 total += 1;
+                if sub.confirmed {
+                    confirmed += 1;
+                }
                 if sub.unsubscribed {
                     unsubscribed += 1;
                 }
@@ -191,7 +288,12 @@ impl Waitlist {
             }
         }
 
-        json!({ "total": total, "unsubscribed": unsubscribed, "last7d": last7d })
+        json!({
+            "total": total,
+            "confirmed": confirmed,
+            "unsubscribed": unsubscribed,
+            "last7d": last7d
+        })
     }
 }
 
@@ -220,10 +322,46 @@ mod tests {
     #[test]
     fn email_validation() {
         assert!(valid_email("user@example.com"));
-        assert!(valid_email("  USER@Example.COM "));
+        assert!(valid_email(&normalize_email("  USER@Example.COM ")));
         assert!(!valid_email("user@localhost"));
         assert!(!valid_email("not-an-email"));
         assert!(!valid_email("a @b.c"));
         assert!(!valid_email("@b.c"));
+    }
+
+    #[test]
+    fn join_confirm_flow() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-flow");
+
+        let email = "unit-flow@test.io";
+        let _ = wl.db.remove(email);
+
+        let (status, code) = wl.join(email.into(), "1.2.3.4".into());
+        assert_eq!(status, JoinStatus::Created);
+        assert_eq!(code.len(), 6);
+
+        assert_eq!(wl.confirm(email, "000000"), ConfirmStatus::WrongCode);
+        assert_eq!(wl.confirm(email, "123456"), ConfirmStatus::WrongCode);
+        assert_eq!(wl.confirm(email, &code), ConfirmStatus::Confirmed);
+        assert_eq!(wl.confirm(email, &code), ConfirmStatus::AlreadyConfirmed);
+    }
+
+    #[test]
+    fn confirm_attempt_limit() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-attempts");
+
+        let email = "unit-attempts@test.io";
+        let _ = wl.db.remove(email);
+
+        let (_, code) = wl.join(email.into(), "1.2.3.4".into());
+
+        for _ in 0..5 {
+            assert_eq!(wl.confirm(email, "111111"), ConfirmStatus::WrongCode);
+        }
+
+        assert_eq!(wl.confirm(email, "111111"), ConfirmStatus::TooManyAttempts);
+        assert_eq!(wl.confirm(email, &code), ConfirmStatus::TooManyAttempts);
     }
 }

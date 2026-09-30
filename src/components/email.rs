@@ -58,6 +58,46 @@ impl Emailer {
         }
     }
 
+    pub async fn send_code(&self, to: &str, code: &str) {
+        let Some(mailer) = &self.mailer else {
+            return;
+        };
+
+        let to_mailbox: Mailbox = match to.parse() {
+            Ok(m) => m,
+            Err(_) => {
+                error!("SMTP: incorrect destination address {to}");
+                return;
+            }
+        };
+
+        let digits = code
+            .chars()
+            .map(|c| format!(
+                "<td style=\"padding:0 6px;\"><span style=\"display:inline-block;min-width:52px;padding:16px 0;background:#221c30;border:1px solid #ac59ff;border-radius:12px;color:#ffffff;font-size:30px;font-weight:bold;text-align:center;\">{c}</span></td>"
+            ))
+            .collect::<String>();
+
+        let email = match Message::builder()
+            .from(self.from.clone())
+            .to(to_mailbox)
+            .subject("Your Bearby confirmation code")
+            .header(ContentType::TEXT_HTML)
+            .body(code_html(&digits))
+        {
+            Ok(e) => e,
+            Err(e) => {
+                error!("SMTP: build error {e}");
+                return;
+            }
+        };
+
+        match mailer.send(email).await {
+            Ok(_) => info!("SMTP: code sent to {to}"),
+            Err(e) => error!("SMTP: send error {e}"),
+        }
+    }
+
     pub async fn send_welcome(&self, to: &str, unsub_url: &str) {
         let Some(mailer) = &self.mailer else {
             return;
@@ -90,6 +130,26 @@ impl Emailer {
             Err(e) => error!("SMTP: send error {e}"),
         }
     }
+}
+
+fn code_html(digits: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html><body style="margin:0;padding:0;background:#0b0910;font-family:Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0910;padding:48px 16px;">
+<tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#17131f;border:1px solid #2a2338;border-radius:16px;padding:40px;">
+<tr><td style="color:#ac59ff;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">Bearby Card</td></tr>
+<tr><td style="color:#ffffff;font-size:24px;font-weight:bold;padding:14px 0 8px;">Confirm your email</td></tr>
+<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:24px;">Enter this code on the website to finish joining the waitlist. The code is valid for 15 minutes.</td></tr>
+<tr><td align="center" style="padding-bottom:8px;"><table role="presentation" cellpadding="0" cellspacing="0"><tr>{digits}</tr></table></td></tr>
+<tr><td style="color:#6f6880;font-size:13px;padding-top:18px;">If you didn&apos;t request this, just ignore this email.</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"#,
+        digits = digits
+    )
 }
 
 fn welcome_html(unsub_url: &str) -> String {

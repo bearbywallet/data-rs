@@ -55,6 +55,11 @@ fn parse_address(s: &str) -> Option<[u8; 20]> {
     }
 }
 
+#[cfg(test)]
+fn format_address(addr: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(addr))
+}
+
 /// Left-pad a 20-byte address to 32 bytes (ABI encoding).
 fn pad_address(addr: &[u8; 20]) -> [u8; 32] {
     let mut padded = [0u8; 32];

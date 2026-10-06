@@ -131,6 +131,15 @@ pub async fn handle_join(
         );
     }
 
+    // Block Proton Mail before sending anything: known domains, or any custom
+    // domain whose MX records point to Proton servers (checked via DoH).
+    if crate::utils::proton::is_proton_email(&email).await {
+        return json_res(
+            StatusCode::BAD_REQUEST,
+            json!({ "code": -4, "message": "Using Proton Mail? We're currently experiencing delivery issues with Proton Mail. Please use another email address to join the waitlist for now." }),
+        );
+    }
+
     // Same "ok" for every post-pow outcome: no email enumeration.
     let (status, code) = waitlist.join(&email, ip.to_string());
 

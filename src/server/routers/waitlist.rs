@@ -1,4 +1,5 @@
-use crate::models::waitlist::{normalize_email, valid_email, ConfirmStatus, Waitlist};
+use crate::models::waitlist::{normalize_email, valid_email, ConfirmStatus, JoinStatus, Waitlist};
+use crate::utils::geo::{suggested_country, valid_country};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header, Request, Response, StatusCode};
@@ -9,6 +10,12 @@ use crate::components::email::Emailer;
 
 const CORS_METHODS: &str = "GET, POST, OPTIONS";
 const CORS_HEADERS: &str = "Content-Type, Authorization";
+
+/// Public website base URL: email links must point at bearby.io (never at the
+/// API host), per the privacy plan.
+fn site_url() -> String {
+    std::env::var("PUBLIC_SITE_URL").unwrap_or_else(|_| "https://bearby.io".to_string())
+}
 
 fn json_res(status: StatusCode, body: Value) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let response = Response::builder()
@@ -53,6 +60,23 @@ fn incorrect_params() -> Result<Response<Full<Bytes>>, hyper::Error> {
     )
 }
 
+/// Resolves the visitor IP: direct socket peer; behind relayd it is 127.0.0.1 —
+/// then take the real client from X-Forwarded-For (relayd injects $REMOTE_ADDR).
+fn visitor_ip(req: &Request<hyper::body::Incoming>, peer: &str) -> IpAddr {
+    let socket_ip: IpAddr = peer.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
+
+    if socket_ip.is_loopback() {
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|xff| xff.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(socket_ip)
+    } else {
+        socket_ip
+    }
+}
+
 fn page_html(title: &str, text: &str, ok: bool) -> String {
     let accent = if ok { "#ac59ff" } else { "#e05c5c" };
 
@@ -83,19 +107,7 @@ pub async fn handle_join(
     emailer: Arc<Emailer>,
     peer: String,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Direct socket peer; behind relayd it is 127.0.0.1 — then take the real
-    // client from X-Forwarded-For (relayd injects it via $REMOTE_ADDR).
-    let socket_ip: IpAddr = peer.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    let ip: IpAddr = if socket_ip.is_loopback() {
-        req.headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|xff| xff.split(',').next())
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(socket_ip)
-    } else {
-        socket_ip
-    };
+    let ip = visitor_ip(&req, &peer);
 
     if waitlist.rate_limit(ip).is_err() {
         return json_res(
@@ -114,9 +126,18 @@ pub async fn handle_join(
         Err(_) => return incorrect_params(),
     };
 
-    let email = normalize_email(value.get("email").and_then(|v| v.as_str()).unwrap_or_default());
+    let email = normalize_email(
+        value
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    );
     let nonce = value
         .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let source = value
+        .get("source")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
@@ -140,18 +161,118 @@ pub async fn handle_join(
         );
     }
 
-    // Same "ok" for every post-pow outcome: no email enumeration.
-    let (status, code) = waitlist.join(&email, ip.to_string());
+    let (status, code) = waitlist.join(&email, ip.to_string(), source);
 
     if !code.is_empty() {
         emailer.send_code(&email, &code).await;
     }
 
-    let _ = status;
+    // Already-confirmed duplicate: informational amber state on the website,
+    // never an error and never a second email.
+    if status == JoinStatus::Already {
+        return json_res(
+            StatusCode::OK,
+            json!({ "code": -10, "message": "Already on the waitlist" }),
+        );
+    }
 
-    json_res(StatusCode::OK, json!({ "code": 0, "message": "ok" }))
+    // Country guess from the visitor IP — a default for the country select on
+    // the website only; never stored as residence.
+    let mut body = json!({ "code": 0, "message": "ok" });
+
+    if let Some(country) = suggested_country(ip) {
+        body["suggested_country"] = json!(country);
+    }
+
+    json_res(StatusCode::OK, body)
 }
 
+/// POST /api/v1/waitlist/complete — verifies the emailed code together with the
+/// required country of residence and creates the qualified record.
+pub async fn handle_complete(
+    req: Request<hyper::body::Incoming>,
+    waitlist: Arc<Waitlist>,
+    emailer: Arc<Emailer>,
+    peer: String,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let ip = visitor_ip(&req, &peer);
+
+    if waitlist.rate_limit(ip).is_err() {
+        return json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -6, "message": "Too many requests" }),
+        );
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return incorrect_params(),
+    };
+
+    let value: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return incorrect_params(),
+    };
+
+    let email = normalize_email(
+        value
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    );
+    let code = value
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    let country = value
+        .get("country")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
+
+    if !valid_email(&email)
+        || code.len() != 6
+        || !code.chars().all(|c| c.is_ascii_digit())
+        || !valid_country(&country)
+    {
+        return incorrect_params();
+    }
+
+    match waitlist.complete(&email, code, &country) {
+        ConfirmStatus::Confirmed => {
+            if let Some(token) = waitlist.unsub_token(&email) {
+                let unsub = format!("{}/waitlist/unsubscribe?token={}", site_url(), token);
+                let privacy = format!("{}/privacy-policy#card-waitlist", site_url());
+
+                emailer.send_welcome(&email, &unsub, &privacy).await;
+            }
+
+            json_res(StatusCode::OK, json!({ "code": 0, "message": "qualified" }))
+        }
+        ConfirmStatus::AlreadyConfirmed => {
+            json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
+        }
+        ConfirmStatus::WrongCode => json_res(
+            StatusCode::FORBIDDEN,
+            json!({ "code": -7, "message": "Wrong code" }),
+        ),
+        ConfirmStatus::Expired => json_res(
+            StatusCode::GONE,
+            json!({ "code": -8, "message": "Code expired" }),
+        ),
+        ConfirmStatus::TooManyAttempts => json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -9, "message": "Too many attempts" }),
+        ),
+        ConfirmStatus::NotFound => incorrect_params(),
+    }
+}
+
+/// Legacy GET confirm kept for links/clients from before the country step;
+/// new clients use POST /complete. Confirms without country (record stays
+/// unqualified until the user completes the country step on the website).
 pub async fn handle_confirm(
     req: Request<hyper::body::Incoming>,
     waitlist: Arc<Waitlist>,
@@ -163,26 +284,28 @@ pub async fn handle_confirm(
         .collect();
 
     let email = normalize_email(pairs.get("email").map(String::as_str).unwrap_or_default());
-    let code = pairs.get("code").map(String::as_str).unwrap_or_default().trim();
+    let code = pairs
+        .get("code")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
 
     if !valid_email(&email) || code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
         return incorrect_params();
     }
 
-    let status = waitlist.confirm(&email, code);
+    let status = waitlist.complete(&email, code, "");
 
     match status {
         ConfirmStatus::Confirmed => {
-            let base =
-                std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "https://api.zilpay.ru".to_string());
-            let query = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("email", &email)
-                .append_pair("token", &waitlist.token(&email))
-                .finish();
+            let base = site_url();
+            let privacy = format!("{}/privacy-policy#card-waitlist", base);
 
-            emailer
-                .send_welcome(&email, &format!("{}/api/v1/waitlist/unsubscribe?{}", base, query))
-                .await;
+            if let Some(token) = waitlist.unsub_token(&email) {
+                let unsub = format!("{}/waitlist/unsubscribe?token={}", base, token);
+
+                emailer.send_welcome(&email, &unsub, &privacy).await;
+            }
 
             json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
         }
@@ -202,6 +325,51 @@ pub async fn handle_confirm(
             json!({ "code": -9, "message": "Too many attempts" }),
         ),
         ConfirmStatus::NotFound => incorrect_params(),
+    }
+}
+
+/// POST /api/v1/waitlist/unsubscribe — token-only body; the website page
+/// (/waitlist/unsubscribe) proxies this so no email ever appears in a URL.
+pub async fn handle_unsubscribe_token(
+    mut req: Request<hyper::body::Incoming>,
+    waitlist: Arc<Waitlist>,
+    peer: String,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let ip = visitor_ip(&req, &peer);
+
+    if waitlist.rate_limit(ip).is_err() {
+        return json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -6, "message": "Too many requests" }),
+        );
+    }
+
+    let body_bytes = match req.body_mut().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return incorrect_params(),
+    };
+
+    let value: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return incorrect_params(),
+    };
+
+    let token = value
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+
+    if waitlist.unsubscribe_by_token(token) {
+        json_res(
+            StatusCode::OK,
+            json!({ "code": 0, "message": "unsubscribed" }),
+        )
+    } else {
+        json_res(
+            StatusCode::FORBIDDEN,
+            json!({ "code": -11, "message": "Invalid link" }),
+        )
     }
 }
 
@@ -259,5 +427,8 @@ pub async fn handle_stats(
         );
     }
 
-    json_res(StatusCode::OK, json!({ "code": 0, "data": waitlist.stats() }))
+    json_res(
+        StatusCode::OK,
+        json!({ "code": 0, "data": waitlist.stats() }),
+    )
 }

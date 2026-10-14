@@ -1,12 +1,13 @@
 use crate::config::waitlist::{
-    WAITLIST_CODE_MAX_ATTEMPTS, WAITLIST_CODE_TTL_SECS, WAITLIST_EMAIL_COOLDOWN_SECS,
-    WAITLIST_KEY, WAITLIST_POW_DIFFICULTY, WAITLIST_RATE_LIMIT_MAX, WAITLIST_RATE_LIMIT_WINDOW_SECS,
+    WAITLIST_CODE_MAX_ATTEMPTS, WAITLIST_CODE_TTL_SECS, WAITLIST_EMAIL_COOLDOWN_SECS, WAITLIST_KEY,
+    WAITLIST_NOTICE_VERSION, WAITLIST_POW_DIFFICULTY, WAITLIST_RATE_LIMIT_MAX,
+    WAITLIST_RATE_LIMIT_WINDOW_SECS, WAITLIST_SOURCE_MAX_LEN,
 };
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sled::Db;
+use sled::{Db, Tree};
 use std::{
     collections::HashMap,
     io::{Error, ErrorKind},
@@ -30,6 +31,23 @@ pub struct Subscriber {
     pub code_expires: u64,
     #[serde(default)]
     pub attempts: u32,
+    /// Self-reported country of residence (ISO 3166-1 alpha-2), required to qualify.
+    #[serde(default)]
+    pub country: String,
+    /// utm_source captured at signup; empty means direct_or_unattributed.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub confirmed_at: u64,
+    #[serde(default)]
+    pub country_at: u64,
+    #[serde(default)]
+    pub consent_ts: u64,
+    #[serde(default)]
+    pub notice_version: String,
+    /// Purpose-specific opaque token for the bearby.io unsubscribe link.
+    #[serde(default)]
+    pub unsub_token: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,6 +70,8 @@ pub enum ConfirmStatus {
 
 pub struct Waitlist {
     db: Db,
+    /// Counters live in a separate tree so email keys and db.len() stay clean.
+    meta: Tree,
     secret: String,
     rate: Mutex<HashMap<IpAddr, (Instant, usize)>>,
 }
@@ -95,15 +115,18 @@ pub fn pow_leading_zero_bits(preimage: &str) -> u32 {
 
 impl Waitlist {
     pub fn new(db_path: &str) -> Self {
-        let secret =
-            std::env::var("WAITLIST_SECRET").expect("ENV var WAITLIST_SECRET is required");
+        let secret = std::env::var("WAITLIST_SECRET").expect("ENV var WAITLIST_SECRET is required");
         let db = sled::open(format!("{}/{}", db_path, WAITLIST_KEY))
             .expect("Cannot waitlist open database.");
+        let meta = db
+            .open_tree(b"WAITLIST_META")
+            .expect("Cannot open waitlist meta tree");
 
         info!("WAITLIST: loaded, {} subscribers", db.len());
 
         Waitlist {
             db,
+            meta,
             secret,
             rate: Mutex::new(HashMap::new()),
         }
@@ -148,9 +171,21 @@ impl Waitlist {
         format!("{:06}", n)
     }
 
+    /// Opaque unsubscribe token, generated once per subscriber and stored.
+    fn gen_unsub_token(&self, email: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let digest =
+            Sha256::digest(format!("unsub|{}|{}|{}", self.secret, email, nanos).as_bytes());
+
+        hex::encode(digest)[..32].to_string()
+    }
+
     /// Start/resume a subscription: (re)generate the confirmation code and email it.
     /// Returns (status, code) — code is empty when nothing was sent (cooldown / already confirmed).
-    pub fn join(&self, email: &str, ip: String) -> (JoinStatus, String) {
+    pub fn join(&self, email: &str, ip: String, source: &str) -> (JoinStatus, String) {
         let ts = now();
 
         match self.db.get(email) {
@@ -165,9 +200,20 @@ impl Waitlist {
                     code: String::new(),
                     code_expires: 0,
                     attempts: 0,
+                    country: String::new(),
+                    source: String::new(),
+                    confirmed_at: 0,
+                    country_at: 0,
+                    consent_ts: ts,
+                    notice_version: WAITLIST_NOTICE_VERSION.into(),
+                    unsub_token: String::new(),
                 });
 
+                // Confirmed subscriber: informational duplicate. Keep the record
+                // as is (no second email, no confirmation reset), count the
+                // duplicate attempt for the readout.
                 if sub.confirmed && !sub.unsubscribed {
+                    self.bump_duplicates();
                     return (JoinStatus::Already, String::new());
                 }
 
@@ -184,6 +230,12 @@ impl Waitlist {
                 sub.code = code.clone();
                 sub.code_expires = ts + WAITLIST_CODE_TTL_SECS;
                 sub.attempts = 0;
+                // The first source wins; later submissions do not re-attribute.
+                if sub.source.is_empty() {
+                    sub.source = sanitize_source(source);
+                }
+                sub.consent_ts = ts;
+                sub.notice_version = WAITLIST_NOTICE_VERSION.into();
 
                 let status = if sub.id == 0 {
                     sub.id = (self.db.len() + 1) as u64;
@@ -193,6 +245,7 @@ impl Waitlist {
                 };
 
                 let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
+
                 (status, code)
             }
             _ => {
@@ -207,6 +260,13 @@ impl Waitlist {
                     code: code.clone(),
                     code_expires: ts + WAITLIST_CODE_TTL_SECS,
                     attempts: 0,
+                    country: String::new(),
+                    source: sanitize_source(source),
+                    confirmed_at: 0,
+                    country_at: 0,
+                    consent_ts: ts,
+                    notice_version: WAITLIST_NOTICE_VERSION.into(),
+                    unsub_token: self.gen_unsub_token(email),
                 };
                 let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
                 (JoinStatus::Created, code)
@@ -214,8 +274,10 @@ impl Waitlist {
         }
     }
 
-    /// Verify the emailed code. Only the mailbox owner can pass.
-    pub fn confirm(&self, email: &str, code: &str) -> ConfirmStatus {
+    /// Verify the emailed code AND the required country of residence. Only a
+    /// valid code plus country creates the qualified record (and triggers the
+    /// welcome email in the router).
+    pub fn complete(&self, email: &str, code: &str, country: &str) -> ConfirmStatus {
         let bytes = match self.db.get(email) {
             Ok(Some(b)) => b,
             _ => return ConfirmStatus::NotFound,
@@ -247,9 +309,72 @@ impl Waitlist {
         }
 
         sub.confirmed = true;
+        sub.confirmed_at = ts;
+        sub.country = country.to_uppercase();
+        sub.country_at = ts;
         sub.code.clear();
+
+        if sub.unsub_token.is_empty() {
+            sub.unsub_token = self.gen_unsub_token(email);
+        }
+
         let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
         ConfirmStatus::Confirmed
+    }
+
+    /// The stored purpose-specific unsubscribe token; legacy records get one
+    /// lazily so every welcome email carries a working link.
+    pub fn unsub_token(&self, email: &str) -> Option<String> {
+        let bytes = self.db.get(email).ok()??;
+        let mut sub: Subscriber = serde_json::from_slice(&bytes).ok()?;
+
+        if sub.unsub_token.is_empty() {
+            sub.unsub_token = self.gen_unsub_token(email);
+            let _ = self.db.insert(email, serde_json::to_vec(&sub).unwrap());
+        }
+
+        Some(sub.unsub_token)
+    }
+
+    pub fn unsubscribe_by_token(&self, token: &str) -> bool {
+        if token.len() != 32 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+
+        for entry in self.db.iter().flatten() {
+            if let Ok(mut sub) = serde_json::from_slice::<Subscriber>(&entry.1) {
+                if sub.unsub_token == token {
+                    sub.unsubscribed = true;
+                    let _ = self.db.insert(
+                        String::from_utf8_lossy(&entry.0).as_ref(),
+                        serde_json::to_vec(&sub).unwrap(),
+                    );
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn bump_duplicates(&self) {
+        let _ = self.meta.fetch_and_update(b"duplicates", |old| {
+            let n = old
+                .and_then(|b| <[u8; 8]>::try_from(&b[..]).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            Some((n + 1).to_be_bytes().to_vec())
+        });
+    }
+
+    fn duplicates(&self) -> u64 {
+        self.meta
+            .get(b"duplicates")
+            .ok()
+            .flatten()
+            .and_then(|b| <[u8; 8]>::try_from(&b[..]).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
     }
 
     pub fn unsubscribe(&self, email: &str) {
@@ -270,31 +395,89 @@ impl Waitlist {
     }
 
     pub fn stats(&self) -> serde_json::Value {
-        let (mut total, mut confirmed, mut unsubscribed, mut last7d) = (0u64, 0u64, 0u64, 0u64);
+        let (mut total, mut confirmed, mut qualified, mut unsubscribed, mut last7d) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut by_country: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut by_source: HashMap<String, (u64, u64, u64)> = HashMap::new();
         let week_ago = now() - 7 * 24 * 3600;
 
         for entry in self.db.iter().flatten() {
             if let Ok(sub) = serde_json::from_slice::<Subscriber>(&entry.1) {
                 total += 1;
+
                 if sub.confirmed {
                     confirmed += 1;
                 }
+
+                let is_qualified = sub.confirmed && !sub.country.is_empty();
+
+                if is_qualified {
+                    qualified += 1;
+                }
+
                 if sub.unsubscribed {
                     unsubscribed += 1;
                 }
+
                 if sub.ts >= week_ago {
                     last7d += 1;
+                }
+
+                let country_key = if sub.country.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    sub.country.clone()
+                };
+                let country_entry = by_country.entry(country_key).or_insert((0, 0));
+                country_entry.0 += 1;
+
+                if is_qualified {
+                    country_entry.1 += 1;
+                }
+
+                let source_key = if sub.source.is_empty() {
+                    "direct_or_unattributed".to_string()
+                } else {
+                    sub.source.clone()
+                };
+                let source_entry = by_source.entry(source_key).or_insert((0, 0, 0));
+                source_entry.0 += 1;
+
+                if sub.confirmed {
+                    source_entry.1 += 1;
+                }
+
+                if is_qualified {
+                    source_entry.2 += 1;
                 }
             }
         }
 
         json!({
             "total": total,
-            "confirmed": confirmed,
+            "email_confirmed": confirmed,
+            "qualified": qualified,
             "unsubscribed": unsubscribed,
-            "last7d": last7d
+            "duplicates": self.duplicates(),
+            "last7d": last7d,
+            "by_country": by_country,
+            "by_source": by_source
         })
     }
+}
+
+/// utm_source: lowercase `[a-z0-9_-]`, capped length; anything else is dropped
+/// (the signup itself is never rejected because of a bad source).
+fn sanitize_source(source: &str) -> String {
+    let clean: String = source
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')
+        .take(WAITLIST_SOURCE_MAX_LEN)
+        .collect();
+
+    clean
 }
 
 #[cfg(test)]
@@ -337,14 +520,87 @@ mod tests {
         let email = "unit-flow@test.io";
         let _ = wl.db.remove(email);
 
-        let (status, code) = wl.join(email.into(), "1.2.3.4".into());
+        let (status, code) = wl.join(email.into(), "1.2.3.4".into(), "x");
         assert_eq!(status, JoinStatus::Created);
         assert_eq!(code.len(), 6);
 
-        assert_eq!(wl.confirm(email, "000000"), ConfirmStatus::WrongCode);
-        assert_eq!(wl.confirm(email, "123456"), ConfirmStatus::WrongCode);
-        assert_eq!(wl.confirm(email, &code), ConfirmStatus::Confirmed);
-        assert_eq!(wl.confirm(email, &code), ConfirmStatus::AlreadyConfirmed);
+        assert_eq!(wl.complete(email, "000000", "US"), ConfirmStatus::WrongCode);
+        assert_eq!(wl.complete(email, "123456", "US"), ConfirmStatus::WrongCode);
+        assert_eq!(wl.complete(email, &code, "us"), ConfirmStatus::Confirmed);
+        assert_eq!(
+            wl.complete(email, &code, "US"),
+            ConfirmStatus::AlreadyConfirmed
+        );
+
+        // Qualification fields are recorded with the completion.
+        let sub: Subscriber = serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
+        assert_eq!(sub.country, "US");
+        assert!(sub.confirmed_at > 0);
+        assert!(sub.country_at > 0);
+        assert_eq!(sub.source, "x");
+        assert_eq!(sub.unsub_token.len(), 32);
+    }
+
+    #[test]
+    fn duplicate_join_keeps_confirmation() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-duplicate");
+
+        let email = "unit-duplicate@test.io";
+        let _ = wl.db.remove(email);
+        // The meta tree persists between test runs.
+        let _ = wl.meta.remove(b"duplicates");
+
+        let (_, code) = wl.join(email.into(), "1.2.3.4".into(), "");
+        assert_eq!(wl.complete(email, &code, "DE"), ConfirmStatus::Confirmed);
+
+        // Repeat submission: no new code, record untouched.
+        let (status, code) = wl.join(email.into(), "5.6.7.8".into(), "linkedin");
+        assert_eq!(status, JoinStatus::Already);
+        assert!(code.is_empty());
+
+        let sub: Subscriber = serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
+        assert!(sub.confirmed);
+        assert_eq!(sub.country, "DE");
+        assert_eq!(sub.source, "");
+
+        let stats = wl.stats();
+        assert_eq!(stats["duplicates"], 1);
+        assert_eq!(stats["email_confirmed"], 1);
+        assert_eq!(stats["qualified"], 1);
+    }
+
+    #[test]
+    fn first_source_wins() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-source");
+
+        let email = "unit-source@test.io";
+        let _ = wl.db.remove(email);
+
+        wl.join(email.into(), "1.2.3.4".into(), "X");
+        let sub: Subscriber = serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
+        assert_eq!(sub.source, "x");
+    }
+
+    #[test]
+    fn unsubscribe_by_stored_token() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-unsub");
+
+        let email = "unit-unsub@test.io";
+        let _ = wl.db.remove(email);
+
+        let (_, code) = wl.join(email.into(), "1.2.3.4".into(), "");
+        assert_eq!(wl.complete(email, &code, "SG"), ConfirmStatus::Confirmed);
+
+        let token = wl.unsub_token(email).unwrap();
+        assert!(!wl.unsubscribe_by_token("short"));
+        assert!(!wl.unsubscribe_by_token(&"g".repeat(32)));
+        assert!(wl.unsubscribe_by_token(&token));
+
+        let sub: Subscriber = serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
+        assert!(sub.unsubscribed);
     }
 
     #[test]
@@ -355,13 +611,19 @@ mod tests {
         let email = "unit-attempts@test.io";
         let _ = wl.db.remove(email);
 
-        let (_, code) = wl.join(email.into(), "1.2.3.4".into());
+        let (_, code) = wl.join(email.into(), "1.2.3.4".into(), "");
 
         for _ in 0..5 {
-            assert_eq!(wl.confirm(email, "111111"), ConfirmStatus::WrongCode);
+            assert_eq!(wl.complete(email, "111111", "US"), ConfirmStatus::WrongCode);
         }
 
-        assert_eq!(wl.confirm(email, "111111"), ConfirmStatus::TooManyAttempts);
-        assert_eq!(wl.confirm(email, &code), ConfirmStatus::TooManyAttempts);
+        assert_eq!(
+            wl.complete(email, "111111", "US"),
+            ConfirmStatus::TooManyAttempts
+        );
+        assert_eq!(
+            wl.complete(email, &code, "US"),
+            ConfirmStatus::TooManyAttempts
+        );
     }
 }

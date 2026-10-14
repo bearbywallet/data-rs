@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+db_ip = { version = "0.3", default-features = true }
 hex = "0.4.3"
 log = "0.4.22"
 reqwest = { version = "0.12.15", features = ["rustls-tls", "json", "gzip", "brotli"], default-features = false }

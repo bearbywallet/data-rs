@@ -1,5 +1,5 @@
 use lettre::{
-    message::{header::ContentType, Mailbox, MultiPart},
+    message::{Mailbox, MultiPart},
     transport::smtp::authentication::{Credentials, Mechanism},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
@@ -88,8 +88,7 @@ impl Emailer {
             .multipart(MultiPart::alternative_plain_html(
                 code_plain(code),
                 code_html(code),
-            ))
-        {
+            )) {
             Ok(e) => e,
             Err(e) => {
                 error!("SMTP [{}]: build to {to} failed: {e}", self.endpoint);
@@ -103,7 +102,7 @@ impl Emailer {
         }
     }
 
-    pub async fn send_welcome(&self, to: &str, unsub_url: &str) {
+    pub async fn send_welcome(&self, to: &str, unsub_url: &str, privacy_url: &str) {
         let Some(mailer) = &self.mailer else {
             return;
         };
@@ -120,9 +119,10 @@ impl Emailer {
             .from(self.from.clone())
             .to(to_mailbox)
             .subject("You're on the Bearby Card waitlist!")
-            .header(ContentType::TEXT_HTML)
-            .body(welcome_html(unsub_url))
-        {
+            .multipart(MultiPart::alternative_plain_html(
+                welcome_plain(unsub_url),
+                welcome_html(unsub_url, privacy_url),
+            )) {
             Ok(e) => e,
             Err(e) => {
                 error!("SMTP [{}]: build to {to} failed: {e}", self.endpoint);
@@ -163,7 +163,13 @@ fn code_plain(code: &str) -> String {
     )
 }
 
-fn welcome_html(unsub_url: &str) -> String {
+fn welcome_plain(unsub_url: &str) -> String {
+    format!(
+        "You're on the waitlist!\n\nThanks for your interest in the Bearby Card. We'll email you as soon as it becomes available.\n\nWe use your email and country of residence to communicate about Bearby Card availability and plan card support. See our Privacy Policy: https://bearby.io/privacy-policy#card-waitlist\n\nUnsubscribe: {unsub_url}\n"
+    )
+}
+
+fn welcome_html(unsub_url: &str, privacy_url: &str) -> String {
     format!(
         r#"<!doctype html>
 <html><body style="margin:0;padding:0;background:#0b0910;font-family:Arial,Helvetica,sans-serif;">
@@ -172,7 +178,8 @@ fn welcome_html(unsub_url: &str) -> String {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#17131f;border:1px solid #2a2338;border-radius:16px;padding:40px;">
 <tr><td style="color:#ac59ff;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">Bearby Card</td></tr>
 <tr><td style="color:#ffffff;font-size:24px;font-weight:bold;padding:14px 0 8px;">You&#39;re on the waitlist!</td></tr>
-<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:28px;">Thanks for your interest in the Bearby Card. We&#39;ll email you as soon as it becomes available.</td></tr>
+<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:12px;">Thanks for your interest in the Bearby Card. We&#39;ll email you as soon as it becomes available.</td></tr>
+<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:28px;">We use your email and country of residence to communicate about Bearby Card availability and plan card support. See our <a href="{privacy}" style="color:#ac59ff;">Privacy Policy</a>.</td></tr>
 <tr><td style="border-top:1px solid #2a2338;padding-top:20px;">
 <a href="{unsub}" style="color:#8f86a0;font-size:13px;">Unsubscribe</a>
 </td></tr>
@@ -180,7 +187,8 @@ fn welcome_html(unsub_url: &str) -> String {
 </td></tr>
 </table>
 </body></html>"#,
-        unsub = unsub_url
+        unsub = unsub_url,
+        privacy = privacy_url
     )
 }
 

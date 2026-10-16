@@ -3,13 +3,14 @@ use crate::config::waitlist::{
     WAITLIST_NOTICE_VERSION, WAITLIST_POW_DIFFICULTY, WAITLIST_RATE_LIMIT_MAX,
     WAITLIST_RATE_LIMIT_WINDOW_SECS, WAITLIST_SOURCE_MAX_LEN,
 };
+use crate::utils::geo::suggested_country;
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sled::{Db, Tree};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Error, ErrorKind},
     net::IpAddr,
     sync::Mutex,
@@ -394,12 +395,35 @@ impl Waitlist {
             .to_string()
     }
 
+    /// Everything the waitlist can report: totals, time windows, breakdowns by
+    /// country/source/notice-version/email-domain, an IP-estimated geo split
+    /// and a 30-day daily event series. Consumed by GET /api/v1/waitlist/stats.
     pub fn stats(&self) -> serde_json::Value {
-        let (mut total, mut confirmed, mut qualified, mut unsubscribed, mut last7d) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
-        let mut by_country: HashMap<String, (u64, u64)> = HashMap::new();
+        let now_ts = now();
+        let (cut_24h, cut_7d, cut_30d) = (
+            now_ts - 24 * 3600,
+            now_ts - 7 * 24 * 3600,
+            now_ts - 30 * 24 * 3600,
+        );
+
+        let (mut total, mut confirmed, mut qualified, mut unsubscribed, mut active, mut pending) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut last24h, mut last7d, mut last30d) = (0u64, 0u64, 0u64);
+        let (mut confirmed_last7d, mut qualified_last7d) = (0u64, 0u64);
+        let (mut code_attempts, mut first_ts, mut last_ts) = (0u64, u64::MAX, 0u64);
+        let mut unique_ips: HashSet<String> = HashSet::new();
+
+        // country: (total, confirmed, qualified, unsubscribed)
+        let mut by_country: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+        // source: (total, confirmed, qualified)
         let mut by_source: HashMap<String, (u64, u64, u64)> = HashMap::new();
-        let week_ago = now() - 7 * 24 * 3600;
+        let mut by_notice_version: HashMap<String, u64> = HashMap::new();
+        let mut by_domain: HashMap<String, u64> = HashMap::new();
+        // Estimated signup country resolved from the stored IP (db-ip lookup);
+        // this is NOT the self-reported residence.
+        let mut estimated_by_country: HashMap<String, u64> = HashMap::new();
+        // UTC day -> (signups, confirmations, qualifications)
+        let mut daily: HashMap<String, (u64, u64, u64)> = HashMap::new();
 
         for entry in self.db.iter().flatten() {
             if let Ok(sub) = serde_json::from_slice::<Subscriber>(&entry.1) {
@@ -417,22 +441,58 @@ impl Waitlist {
 
                 if sub.unsubscribed {
                     unsubscribed += 1;
+                } else if sub.confirmed {
+                    active += 1;
                 }
 
-                if sub.ts >= week_ago {
+                // Still unconfirmed but inside its code lifetime: may convert yet.
+                if !sub.confirmed && sub.code_expires > now_ts {
+                    pending += 1;
+                }
+
+                if sub.ts >= cut_24h {
+                    last24h += 1;
+                }
+
+                if sub.ts >= cut_7d {
                     last7d += 1;
                 }
+
+                if sub.ts >= cut_30d {
+                    last30d += 1;
+                }
+
+                if sub.confirmed_at >= cut_7d {
+                    confirmed_last7d += 1;
+                }
+
+                if sub.country_at >= cut_7d {
+                    qualified_last7d += 1;
+                }
+
+                code_attempts += u64::from(sub.attempts);
+                unique_ips.insert(sub.ip.clone());
+                first_ts = first_ts.min(sub.ts);
+                last_ts = last_ts.max(sub.ts);
 
                 let country_key = if sub.country.is_empty() {
                     "unknown".to_string()
                 } else {
                     sub.country.clone()
                 };
-                let country_entry = by_country.entry(country_key).or_insert((0, 0));
+                let country_entry = by_country.entry(country_key).or_insert((0, 0, 0, 0));
                 country_entry.0 += 1;
 
-                if is_qualified {
+                if sub.confirmed {
                     country_entry.1 += 1;
+                }
+
+                if is_qualified {
+                    country_entry.2 += 1;
+                }
+
+                if sub.unsubscribed {
+                    country_entry.3 += 1;
                 }
 
                 let source_key = if sub.source.is_empty() {
@@ -450,20 +510,115 @@ impl Waitlist {
                 if is_qualified {
                     source_entry.2 += 1;
                 }
+
+                *by_notice_version
+                    .entry(if sub.notice_version.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        sub.notice_version.clone()
+                    })
+                    .or_insert(0) += 1;
+
+                let email = String::from_utf8_lossy(&entry.0);
+                let domain = email.rsplit('@').next().unwrap_or("unknown");
+                *by_domain.entry(domain.to_string()).or_insert(0) += 1;
+
+                let guessed = sub
+                    .ip
+                    .parse::<IpAddr>()
+                    .ok()
+                    .and_then(suggested_country)
+                    .unwrap_or_else(|| "unknown".to_string());
+                *estimated_by_country.entry(guessed).or_insert(0) += 1;
+
+                // Daily event counts within the 30-day window.
+                if sub.ts >= cut_30d {
+                    daily.entry(date_key(sub.ts)).or_insert((0, 0, 0)).0 += 1;
+                }
+
+                if sub.confirmed_at >= cut_30d {
+                    daily
+                        .entry(date_key(sub.confirmed_at))
+                        .or_insert((0, 0, 0))
+                        .1 += 1;
+                }
+
+                if sub.country_at >= cut_30d {
+                    daily
+                        .entry(date_key(sub.country_at))
+                        .or_insert((0, 0, 0))
+                        .2 += 1;
+                }
             }
         }
 
+        // Every day of the window is present so charts have no gaps.
+        let mut daily_series = serde_json::Map::new();
+        for offset in (0..30).rev() {
+            let key = date_key(now_ts - offset * 86_400);
+            let (signups, confirmed_day, qualified_day) =
+                daily.get(&key).copied().unwrap_or((0, 0, 0));
+            daily_series.insert(
+                key,
+                json!({
+                    "signups": signups,
+                    "confirmed": confirmed_day,
+                    "qualified": qualified_day
+                }),
+            );
+        }
+
         json!({
+            "generated_at": now_ts,
             "total": total,
             "email_confirmed": confirmed,
+            "unconfirmed": total - confirmed,
             "qualified": qualified,
             "unsubscribed": unsubscribed,
+            "active": active,
+            "pending": pending,
             "duplicates": self.duplicates(),
+            "code_attempts": code_attempts,
+            "unique_ips": unique_ips.len(),
+            "first_signup_at": if total > 0 { first_ts } else { 0 },
+            "last_signup_at": last_ts,
+            "last24h": last24h,
             "last7d": last7d,
-            "by_country": by_country,
-            "by_source": by_source
+            "last30d": last30d,
+            "confirmed_last7d": confirmed_last7d,
+            "qualified_last7d": qualified_last7d,
+            "by_country": by_country.into_iter().map(|(k, v)| (k, json!({
+                "total": v.0,
+                "confirmed": v.1,
+                "qualified": v.2,
+                "unsubscribed": v.3
+            }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+            "by_source": by_source.into_iter().map(|(k, v)| (k, json!({
+                "total": v.0,
+                "confirmed": v.1,
+                "qualified": v.2
+            }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+            "by_notice_version": by_notice_version,
+            "by_domain": by_domain,
+            "estimated_by_country": estimated_by_country,
+            "daily": daily_series
         })
     }
+}
+
+/// Unix seconds -> "YYYY-MM-DD" (UTC) for the daily stats buckets. Civil-days
+/// algorithm (Howard Hinnant); avoids pulling in a date crate.
+fn date_key(ts: u64) -> String {
+    let z = (ts / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// utm_source: lowercase `[a-z0-9_-]`, capped length; anything else is dropped
@@ -622,8 +777,83 @@ mod tests {
             ConfirmStatus::TooManyAttempts
         );
         assert_eq!(
-            wl.complete(email, &code, "US"),
+            wl.complete(email, "111111", "US"),
             ConfirmStatus::TooManyAttempts
         );
+    }
+
+    #[test]
+    fn date_key_formats_utc_days() {
+        assert_eq!(date_key(0), "1970-01-01");
+        assert_eq!(date_key(86_399), "1970-01-01");
+        assert_eq!(date_key(86_400), "1970-01-02");
+        assert_eq!(date_key(1_760_000_000), "2025-10-09");
+    }
+
+    #[test]
+    fn stats_full_breakdown() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-stats");
+
+        let email = "unit-stats@test.io";
+        let _ = wl.db.remove(email);
+        let pending_email = "unit-stats-pending@test.io";
+        let _ = wl.db.remove(pending_email);
+        let _ = wl.meta.remove(b"duplicates");
+
+        let (_, code) = wl.join(email.into(), "1.2.3.4".into(), "linkedin");
+        assert_eq!(wl.complete(email, &code, "US"), ConfirmStatus::Confirmed);
+
+        // Second record: joined, never confirmed, code still alive.
+        wl.join(pending_email.into(), "5.6.7.8".into(), "");
+
+        let stats = wl.stats();
+
+        assert_eq!(stats["total"], 2);
+        assert_eq!(stats["email_confirmed"], 1);
+        assert_eq!(stats["unconfirmed"], 1);
+        assert_eq!(stats["qualified"], 1);
+        assert_eq!(stats["unsubscribed"], 0);
+        assert_eq!(stats["active"], 1);
+        assert_eq!(stats["pending"], 1);
+        assert_eq!(stats["last24h"], 2);
+        assert_eq!(stats["last7d"], 2);
+        assert_eq!(stats["last30d"], 2);
+        assert_eq!(stats["confirmed_last7d"], 1);
+        assert_eq!(stats["qualified_last7d"], 1);
+        assert_eq!(stats["unique_ips"], 2);
+        assert!(stats["first_signup_at"].as_u64().unwrap() > 0);
+        assert!(stats["last_signup_at"].as_u64().unwrap() > 0);
+
+        let us = &stats["by_country"]["US"];
+        assert_eq!(us["total"], 1);
+        assert_eq!(us["confirmed"], 1);
+        assert_eq!(us["qualified"], 1);
+        assert_eq!(us["unsubscribed"], 0);
+        assert_eq!(stats["by_country"]["unknown"]["total"], 1);
+
+        assert_eq!(stats["by_source"]["linkedin"]["total"], 1);
+        assert_eq!(stats["by_source"]["linkedin"]["confirmed"], 1);
+        assert_eq!(stats["by_source"]["linkedin"]["qualified"], 1);
+        assert_eq!(stats["by_source"]["direct_or_unattributed"]["total"], 1);
+
+        assert_eq!(stats["by_domain"]["test.io"], 2);
+        assert_eq!(stats["by_notice_version"].as_object().unwrap().len(), 1);
+
+        // Estimated geo must account for every signup IP.
+        let estimated: u64 = stats["estimated_by_country"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        assert_eq!(estimated, 2);
+
+        let daily = stats["daily"].as_object().unwrap();
+        assert_eq!(daily.len(), 30);
+        let today = daily.get(&date_key(now())).unwrap();
+        assert_eq!(today["signups"], 2);
+        assert_eq!(today["confirmed"], 1);
+        assert_eq!(today["qualified"], 1);
     }
 }

@@ -21,6 +21,20 @@ use std::{
 pub struct Subscriber {
     pub id: u64,
     pub ts: u64,
+    /// Signup cycle the record is currently on; 1-based, incremented only on
+    /// resubscribe after an explicit unsubscribe (retries are idempotent).
+    #[serde(default)]
+    pub cycle: u32,
+    /// Original signup time; never reset so first-contact history survives.
+    #[serde(default)]
+    pub created_ts: u64,
+    /// Start time of the CURRENT cycle (== created_ts for cycle 1).
+    #[serde(default)]
+    pub cycle_ts: u64,
+    /// Cycle whose verification-email send was already counted
+    /// (one counted send per cycle; in-cycle resends are not re-counted).
+    #[serde(default)]
+    pub sent_cycle: u32,
     pub ip: String,
     pub unsubscribed: bool,
     pub last_email: u64,
@@ -194,6 +208,10 @@ impl Waitlist {
                 let mut sub: Subscriber = serde_json::from_slice(&bytes).unwrap_or(Subscriber {
                     id: 0,
                     ts,
+                    cycle: 0,
+                    created_ts: 0,
+                    cycle_ts: 0,
+                    sent_cycle: 0,
                     ip,
                     unsubscribed: false,
                     last_email: 0,
@@ -224,16 +242,45 @@ impl Waitlist {
                     return (JoinStatus::Cooldown, String::new());
                 }
 
+                // Legacy records predate the cycle fields: backfill as cycle 1.
+                if sub.cycle == 0 {
+                    sub.cycle = 1;
+                    if sub.created_ts == 0 {
+                        sub.created_ts = sub.ts;
+                    }
+                    if sub.cycle_ts == 0 {
+                        sub.cycle_ts = sub.ts;
+                    }
+                }
+
                 let code = self.gen_code(email);
+                // A new cycle is only opened after an explicit unsubscribe;
+                // retries/resends stay inside the current cycle.
+                let new_cycle = sub.unsubscribed;
                 sub.unsubscribed = false;
                 sub.confirmed = false;
+                // The previous cycle's confirmation belongs to that cycle; a
+                // new cycle must qualify again (code + country together).
+                sub.confirmed_at = 0;
+                sub.country.clear();
+                sub.country_at = 0;
                 sub.last_email = ts;
                 sub.code = code.clone();
                 sub.code_expires = ts + WAITLIST_CODE_TTL_SECS;
                 sub.attempts = 0;
-                // The first source wins; later submissions do not re-attribute.
-                if sub.source.is_empty() {
+                if new_cycle {
+                    // Per-cycle attribution: every new cycle records the
+                    // source it was (re)joined with. Inside one cycle the
+                    // first source still wins.
                     sub.source = sanitize_source(source);
+                    sub.cycle = sub.cycle.saturating_add(1);
+                    sub.cycle_ts = ts;
+                    self.bump_cycles_added();
+                } else if sub.source.is_empty() {
+                    sub.source = sanitize_source(source);
+                }
+                if sub.sent_cycle == 0 {
+                    sub.sent_cycle = sub.cycle; // legacy records: already emailed
                 }
                 sub.consent_ts = ts;
                 sub.notice_version = WAITLIST_NOTICE_VERSION.into();
@@ -254,6 +301,10 @@ impl Waitlist {
                 let sub = Subscriber {
                     id: (self.db.len() + 1) as u64,
                     ts,
+                    cycle: 1,
+                    created_ts: ts,
+                    cycle_ts: ts,
+                    sent_cycle: 0,
                     ip,
                     unsubscribed: false,
                     last_email: ts,
@@ -358,8 +409,8 @@ impl Waitlist {
         false
     }
 
-    fn bump_duplicates(&self) {
-        let _ = self.meta.fetch_and_update(b"duplicates", |old| {
+    fn bump_meta(&self, key: &[u8]) {
+        let _ = self.meta.fetch_and_update(key, |old| {
             let n = old
                 .and_then(|b| <[u8; 8]>::try_from(&b[..]).ok())
                 .map(u64::from_be_bytes)
@@ -368,14 +419,67 @@ impl Waitlist {
         });
     }
 
-    fn duplicates(&self) -> u64 {
+    fn meta_counter(&self, key: &[u8]) -> u64 {
         self.meta
-            .get(b"duplicates")
+            .get(key)
             .ok()
             .flatten()
             .and_then(|b| <[u8; 8]>::try_from(&b[..]).ok())
             .map(u64::from_be_bytes)
             .unwrap_or(0)
+    }
+
+    fn bump_duplicates(&self) {
+        self.bump_meta(b"duplicates");
+    }
+
+    fn duplicates(&self) -> u64 {
+        self.meta_counter(b"duplicates")
+    }
+
+    /// Resubscribe events: each opens a new cycle for an existing record.
+    fn bump_cycles_added(&self) {
+        self.bump_meta(b"cycles_added");
+    }
+
+    fn cycles_added(&self) -> u64 {
+        self.meta_counter(b"cycles_added")
+    }
+
+    /// Total signup cycles started = records + resubscribes. Retries inside
+    /// a cycle never bump it; legacy data needs no migration.
+    pub fn cycles_total(&self) -> u64 {
+        (self.db.len() as u64) + self.cycles_added()
+    }
+
+    /// Successful verification-email sends (bumped by the join handler after
+    /// Emailer::send_code reports SMTP success, once per cycle).
+    pub fn bump_emails_sent(&self) {
+        self.bump_meta(b"emails_sent");
+    }
+
+    fn emails_sent(&self) -> u64 {
+        self.meta_counter(b"emails_sent")
+    }
+
+    /// Mark the current cycle's send as counted. Returns true when this
+    /// cycle had no counted send yet (i.e. the counter should grow).
+    pub fn mark_email_sent(&self, email: &str) -> bool {
+        let Ok(Some(bytes)) = self.db.get(email) else {
+            return false;
+        };
+        let Ok(mut sub) = serde_json::from_slice::<Subscriber>(&bytes) else {
+            return false;
+        };
+        if sub.sent_cycle == sub.cycle {
+            return false;
+        }
+        sub.sent_cycle = sub.cycle;
+        if self.db.insert(email, serde_json::to_vec(&sub).unwrap()).is_err() {
+            return false;
+        }
+        self.bump_emails_sent();
+        true
     }
 
     pub fn unsubscribe(&self, email: &str) {
@@ -450,15 +554,19 @@ impl Waitlist {
                     pending += 1;
                 }
 
-                if sub.ts >= cut_24h {
+                // Rolling windows count cycles by their start; legacy records
+                // without cycle_ts fall back to their signup ts.
+                let start_ts = if sub.cycle_ts > 0 { sub.cycle_ts } else { sub.ts };
+
+                if start_ts >= cut_24h {
                     last24h += 1;
                 }
 
-                if sub.ts >= cut_7d {
+                if start_ts >= cut_7d {
                     last7d += 1;
                 }
 
-                if sub.ts >= cut_30d {
+                if start_ts >= cut_30d {
                     last30d += 1;
                 }
 
@@ -472,8 +580,10 @@ impl Waitlist {
 
                 code_attempts += u64::from(sub.attempts);
                 unique_ips.insert(sub.ip.clone());
-                first_ts = first_ts.min(sub.ts);
-                last_ts = last_ts.max(sub.ts);
+                // first/last signup = earliest-ever / most recent CYCLE start;
+                // a resubscribe moves last_signup_at forward.
+                first_ts = first_ts.min(if sub.created_ts > 0 { sub.created_ts } else { sub.ts });
+                last_ts = last_ts.max(start_ts);
 
                 let country_key = if sub.country.is_empty() {
                     "unknown".to_string()
@@ -570,9 +680,15 @@ impl Waitlist {
 
         json!({
             "generated_at": now_ts,
+            // Grain: "total"/"unique_email_addresses" count distinct addresses;
+            // cycle-level funnel counters below. See "definitions".
             "total": total,
             "email_confirmed": confirmed,
             "unconfirmed": total - confirmed,
+            "unique_email_addresses": total,
+            "signup_cycles_total": self.cycles_total(),
+            "verification_email_sent": self.emails_sent(),
+            "signup_completed": qualified,
             "qualified": qualified,
             "unsubscribed": unsubscribed,
             "active": active,
@@ -601,7 +717,8 @@ impl Waitlist {
             "by_notice_version": by_notice_version,
             "by_domain": by_domain,
             "estimated_by_country": estimated_by_country,
-            "daily": daily_series
+            "daily": daily_series,
+            "definitions": definitions()
         })
     }
 }
@@ -619,6 +736,43 @@ fn date_key(ts: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Self-describing metric semantics shipped with every stats payload so
+/// consumers never have to guess grain, dedup rules, or time boundaries.
+fn definitions() -> serde_json::Value {
+    json!({
+        "grain": "One record per distinct normalized email address. A signup CYCLE is one address's pending->confirmed (or unsubscribed) attempt: retries inside a cycle are idempotent, unsubscribe + resubscribe opens a new cycle on the same address.",
+        "total": "Distinct email addresses ever signed up (== unique_email_addresses). Does NOT grow on retries or resubscriptions.",
+        "unique_email_addresses": "Alias of total: distinct addresses, lower-cased. Only the aggregate count is returned, never the addresses.",
+        "signup_cycles_total": "Distinct signup cycles started: new addresses + resubscribes after unsubscribe. Retries inside a cycle never increment it.",
+        "verification_email_sent": "Cycles whose verification email was accepted by the SMTP relay (counted once per cycle; suppressed in-cycle resends are not counted). This is SENT, not delivered or received.",
+        "email_confirmed": "Addresses that completed signup at least once (valid code verified). Cumulative current state.",
+        "signup_completed": "Alias of qualified: cycles accepted with a valid code AND country together in the final step.",
+        "qualified": "Alias of signup_completed (same counter, not an additional stage).",
+        "unconfirmed": "Addresses whose current cycle has not completed signup (total - email_confirmed).",
+        "active": "Addresses confirmed and not unsubscribed (current status).",
+        "unsubscribed": "Addresses whose latest action was unsubscribe. History is kept; resubscribing opens a new cycle.",
+        "pending": "Unconfirmed addresses whose current code has not expired yet.",
+        "duplicates": "Join attempts for already-confirmed, active addresses (lifetime counter).",
+        "code_attempts": "Wrong code entries recorded during complete() (lifetime sum of per-address attempt counters).",
+        "unique_ips": "Distinct signup IPs over all records (lifetime, no window).",
+        "last24h": "Cycles started in the rolling 24h before generated_at (anchored on cycle start; a resubscribe moves its cycle forward).",
+        "last7d": "Cycles started in the rolling 7 days before generated_at.",
+        "last30d": "Cycles started in the rolling 30 days before generated_at.",
+        "confirmed_last7d": "Cycles whose code was verified in the rolling 7 days before generated_at (confirmed_at).",
+        "qualified_last7d": "Cycles qualified (code + country) in the rolling 7 days before generated_at (country_at).",
+        "first_signup_at": "Earliest cycle-start timestamp over all addresses (Unix seconds, UTC).",
+        "last_signup_at": "Most recent cycle-start timestamp (Unix seconds, UTC); a resubscribe moves it forward.",
+        "generated_at": "When this snapshot was built (Unix seconds, UTC).",
+        "by_source": "Per lowercase utm_source of the CURRENT cycle: addresses (not cycles) with cumulative confirmed/qualified. Empty/invalid source -> direct_or_unattributed. Values are filtered to [a-z0-9_-] and length-capped; each new cycle is attributed to its own source.",
+        "by_country": "Self-reported country of residence per address: totals with confirmed/qualified/unsubscribed.",
+        "by_domain": "Distinct addresses per email domain.",
+        "by_notice_version": "Addresses per consent notice version shown at signup.",
+        "estimated_by_country": "Addresses with a GeoIP-guessed country from the signup IP (heuristic, not self-reported).",
+        "daily": "UTC calendar days for the last 30 days: signups = cycles started that day; confirmed = codes verified that day (confirmed_at); qualified = code+country accepted that day (country_at). Buckets follow current record timestamps, so a resubscribed address re-enters the funnel; rolling-window fields may differ from calendar-day sums by design.",
+        "nesting": "signup_cycles_total >= verification_email_sent >= signup_completed (funnel stages, not additive totals). total == unique_email_addresses counts addresses, not cycles."
+    })
 }
 
 /// utm_source: lowercase `[a-z0-9_-]`, capped length; anything else is dropped
@@ -756,6 +910,79 @@ mod tests {
 
         let sub: Subscriber = serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
         assert!(sub.unsubscribed);
+    }
+
+    #[test]
+    fn resubscribe_opens_new_cycle_with_own_source() {
+        std::env::set_var("WAITLIST_SECRET", "unit-test-secret");
+        let wl = Waitlist::new("/tmp/wl-unit-cycle");
+
+        let email = "unit-cycle@test.io";
+        let _ = wl.db.remove(email);
+        for key in ["duplicates", "cycles_added", "emails_sent"] {
+            let _ = wl.meta.remove(key.as_bytes());
+        }
+
+        // Cycle 1: join, complete (code+country together), source "X"->"x".
+        let (st, code) = wl.join(email.into(), "1.2.3.4".into(), "X");
+        assert_eq!(st, JoinStatus::Created);
+        assert_eq!(wl.cycles_total(), 1);
+        assert_eq!(wl.complete(email, &code, "US"), ConfirmStatus::Confirmed);
+        // One counted verification send per cycle.
+        assert!(wl.mark_email_sent(email));
+        assert!(!wl.mark_email_sent(email));
+
+        // Unsubscribe, then resubscribe -> NEW cycle, new attribution.
+        let token = wl.unsub_token(email).unwrap();
+        assert!(wl.unsubscribe_by_token(&token));
+
+        let (st2, code2) = wl.join(email.into(), "5.6.7.8".into(), "Tyron-Email");
+        assert_eq!(st2, JoinStatus::Resubscribed);
+        assert!(!code2.is_empty());
+        assert_eq!(wl.cycles_total(), 2);
+
+        let sub: Subscriber =
+            serde_json::from_slice(&wl.db.get(email).unwrap().unwrap()).unwrap();
+        assert_eq!(sub.cycle, 2);
+        // Same-second joins make timestamps equal; the cycle number is the
+        // meaningful discriminator here.
+        assert!(sub.created_ts <= sub.cycle_ts && sub.cycle_ts <= sub.ts);
+        assert!(!sub.confirmed); // must qualify again
+        assert_eq!(sub.confirmed_at, 0);
+        assert!(sub.country.is_empty());
+        assert_eq!(sub.attempts, 0);
+        assert_eq!(sub.source, "tyron-email"); // per-cycle attribution
+
+        // Address-level total is unchanged; funnel counters stay nested.
+        let addresses = wl.db.len() as u64;
+        let stats = wl.stats();
+        assert_eq!(stats["total"], addresses);
+        assert_eq!(stats["unique_email_addresses"], stats["total"]);
+        assert_eq!(stats["signup_cycles_total"], 2);
+        assert_eq!(stats["email_confirmed"], 0); // reset on resubscribe
+        assert_eq!(stats["signup_completed"], stats["qualified"]);
+
+        // New cycle's send is counted once, not twice.
+        assert!(wl.mark_email_sent(email));
+        assert!(!wl.mark_email_sent(email));
+
+        // An in-cycle retry is fully idempotent: cooldown-rejected, so no
+        // cycle bump, no record change, no counted send.
+        let (st3, code3) = wl.join(email.into(), "5.6.7.8".into(), "tyron-email");
+        assert_eq!(st3, JoinStatus::Cooldown);
+        assert!(code3.is_empty());
+        assert_eq!(wl.cycles_total(), 2);
+
+        // The abandoned first cycle must not leave a phantom confirmation
+        // in the daily buckets (aggregate vs daily reconciliation).
+        let stats2 = wl.stats();
+        let daily_confirmed: u64 = stats2["daily"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|d| d["confirmed"].as_u64().unwrap())
+            .sum();
+        assert_eq!(daily_confirmed, 0);
     }
 
     #[test]

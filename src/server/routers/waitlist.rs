@@ -164,7 +164,10 @@ pub async fn handle_join(
     let (status, code) = waitlist.join(&email, ip.to_string(), source);
 
     if !code.is_empty() {
-        emailer.send_code(&email, &code).await;
+        // Count each signup cycle's verification email once, on SMTP success.
+        if emailer.send_code(&email, &code).await {
+            waitlist.mark_email_sent(&email);
+        }
     }
 
     // Already-confirmed duplicate: informational amber state on the website,

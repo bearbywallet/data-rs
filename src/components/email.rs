@@ -68,16 +68,19 @@ impl Emailer {
         }
     }
 
-    pub async fn send_code(&self, to: &str, code: &str) {
+    /// Send the verification code. Returns true only when the message was
+    /// accepted by the SMTP relay (i.e. a real send — delivery/receipt is
+    /// not tracked and is a separate concern).
+    pub async fn send_code(&self, to: &str, code: &str) -> bool {
         let Some(mailer) = &self.mailer else {
-            return;
+            return false;
         };
 
         let to_mailbox: Mailbox = match to.parse() {
             Ok(m) => m,
             Err(_) => {
                 error!("SMTP: incorrect destination address {to}");
-                return;
+                return false;
             }
         };
 
@@ -92,13 +95,19 @@ impl Emailer {
             Ok(e) => e,
             Err(e) => {
                 error!("SMTP [{}]: build to {to} failed: {e}", self.endpoint);
-                return;
+                return false;
             }
         };
 
         match mailer.send(email).await {
-            Ok(_) => info!("SMTP: code sent to {to}"),
-            Err(e) => error!("SMTP [{}]: send to {to} failed: {e}", self.endpoint),
+            Ok(_) => {
+                info!("SMTP: code sent to {to}");
+                true
+            }
+            Err(e) => {
+                error!("SMTP [{}]: send to {to} failed: {e}", self.endpoint);
+                false
+            }
         }
     }
 

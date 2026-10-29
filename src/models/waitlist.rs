@@ -753,7 +753,7 @@ fn definitions() -> serde_json::Value {
         "by_notice_version": "Addresses per consent notice version shown at signup.",
         "estimated_by_country": "Addresses with a GeoIP-guessed country from the signup IP (heuristic, not self-reported).",
         "daily": "UTC calendar days for the last 30 days: cycles_started = cycles started that day; qualified = code+country accepted that day (country_at). Buckets follow current record timestamps, so a resubscribed address re-enters the funnel; rolling-window fields may differ from calendar-day sums by design.",
-        "nesting": "cycles_started_total >= verification_email_sent >= qualified (funnel stages, not additive totals). addresses.* buckets are mutually exclusive and sum to addresses.total."
+        "nesting": "Funnel stages, not additive totals: cycles_started_total >= emails accepted by SMTP >= qualified. verification_email_sent counts only sends recorded by its lifetime counter (older sends predate it and resets are possible), so it can legitimately be lower than qualified. addresses.* buckets are mutually exclusive and sum to addresses.total."
     })
 }
 

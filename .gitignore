@@ -11,3 +11,4 @@ Cargo.lock
 
 # Environment / secrets
 .env
+.rlm/

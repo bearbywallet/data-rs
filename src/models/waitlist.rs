@@ -52,6 +52,11 @@ pub struct Subscriber {
     /// utm_source captured at signup; empty means direct_or_unattributed.
     #[serde(default)]
     pub source: String,
+    /// Per-cycle attribution: cycles started per utm_source (key "" =
+    /// direct_or_unattributed). Records predating this field fall back to
+    /// counting all their cycles under the current `source`.
+    #[serde(default)]
+    pub cycles_by_source: HashMap<String, u64>,
     #[serde(default)]
     pub confirmed_at: u64,
     #[serde(default)]
@@ -221,6 +226,7 @@ impl Waitlist {
                     attempts: 0,
                     country: String::new(),
                     source: String::new(),
+                    cycles_by_source: HashMap::new(),
                     confirmed_at: 0,
                     country_at: 0,
                     consent_ts: ts,
@@ -273,6 +279,7 @@ impl Waitlist {
                     // source it was (re)joined with. Inside one cycle the
                     // first source still wins.
                     sub.source = sanitize_source(source);
+                    *sub.cycles_by_source.entry(sub.source.clone()).or_insert(0) += 1;
                     sub.cycle = sub.cycle.saturating_add(1);
                     sub.cycle_ts = ts;
                     self.bump_cycles_added();
@@ -314,6 +321,8 @@ impl Waitlist {
                     attempts: 0,
                     country: String::new(),
                     source: sanitize_source(source),
+                    // First cycle counts under its own source from birth.
+                    cycles_by_source: HashMap::from([(sanitize_source(source), 1u64)]),
                     confirmed_at: 0,
                     country_at: 0,
                     consent_ts: ts,
@@ -603,15 +612,25 @@ impl Waitlist {
                     }
                 }
 
-                let source_key = if sub.source.is_empty() {
-                    "direct_or_unattributed".to_string()
-                } else {
-                    sub.source.clone()
+                let source_key = |s: &str| {
+                    if s.is_empty() {
+                        "direct_or_unattributed".to_string()
+                    } else {
+                        s.to_string()
+                    }
                 };
-                // Per-cycle sources are not stored, so every started cycle of
-                // an address is attributed to its current source.
-                let source_entry = by_source.entry(source_key).or_insert((0, 0));
-                source_entry.0 += sub.cycle.max(1) as u64;
+
+                // Each started cycle counts under the source it was joined
+                // with; cycles predating the per-cycle history (and records
+                // without one) fall back to the address's current source.
+                let tracked: u64 = sub.cycles_by_source.values().sum();
+                for (src, n) in &sub.cycles_by_source {
+                    by_source.entry(source_key(src)).or_insert((0, 0)).0 += *n;
+                }
+
+                let legacy = (sub.cycle.max(1) as u64).saturating_sub(tracked);
+                let source_entry = by_source.entry(source_key(&sub.source)).or_insert((0, 0));
+                source_entry.0 += legacy;
 
                 if is_qualified {
                     source_entry.1 += 1;
@@ -747,7 +766,7 @@ fn definitions() -> serde_json::Value {
         "first_cycle_started_at": "Earliest cycle-start timestamp over all addresses (Unix seconds, UTC).",
         "last_cycle_started_at": "Most recent cycle-start timestamp (Unix seconds, UTC); a resubscribe moves it forward.",
         "generated_at": "When this snapshot was built (Unix seconds, UTC).",
-        "by_source": "Per lowercase utm_source of the CURRENT cycle: cycles_started counts every started cycle attributed to it, qualified counts current qualified addresses. Empty/invalid source -> direct_or_unattributed. Values are filtered to [a-z0-9_-] and length-capped.",
+        "by_source": "Per lowercase utm_source: cycles_started counts each signup cycle under the source it was started with (per-cycle history; cycles recorded before this field existed fall back to the address's current source). qualified counts current qualified addresses. Empty/invalid source -> direct_or_unattributed. Values are filtered to [a-z0-9_-] and length-capped.",
         "by_country": "Self-reported country of residence, limited to qualified and unsubscribed addresses; pending/incomplete addresses may lack a self-reported country.",
         "by_domain": "Distinct addresses per email domain.",
         "by_notice_version": "Addresses per consent notice version shown at signup.",
@@ -942,6 +961,11 @@ mod tests {
         assert_eq!(stats["cycles_started_total"], 2);
         assert_eq!(stats["addresses"]["qualified"], 0); // reset on resubscribe
 
+        // Per-cycle attribution: each cycle counts under its own source,
+        // even though sub.source now holds only the latest one.
+        assert_eq!(stats["by_source"]["x"]["cycles_started"], 1);
+        assert_eq!(stats["by_source"]["tyron-email"]["cycles_started"], 1);
+
         // New cycle's send is counted once, not twice.
         assert!(wl.mark_email_sent(email));
         assert!(!wl.mark_email_sent(email));
@@ -973,7 +997,7 @@ mod tests {
         let email = "unit-attempts@test.io";
         let _ = wl.db.remove(email);
 
-        let (_, code) = wl.join(email.into(), "1.2.3.4".into(), "");
+        let _ = wl.join(email.into(), "1.2.3.4".into(), "");
 
         for _ in 0..5 {
             assert_eq!(wl.complete(email, "111111", "US"), ConfirmStatus::WrongCode);

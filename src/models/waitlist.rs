@@ -510,47 +510,49 @@ impl Waitlist {
             now_ts - 30 * 24 * 3600,
         );
 
-        let (mut total, mut confirmed, mut qualified, mut unsubscribed, mut active, mut pending) =
-            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // Address states are mutually exclusive latest-action buckets:
+        // unsubscribed > qualified > pending; everything else is incomplete.
+        let (mut total, mut qualified, mut unsubscribed, mut pending) =
+            (0u64, 0u64, 0u64, 0u64);
+        let mut qualified_last7d = 0u64;
         let (mut last24h, mut last7d, mut last30d) = (0u64, 0u64, 0u64);
-        let (mut confirmed_last7d, mut qualified_last7d) = (0u64, 0u64);
         let (mut code_attempts, mut first_ts, mut last_ts) = (0u64, u64::MAX, 0u64);
         let mut unique_ips: HashSet<String> = HashSet::new();
 
-        // country: (total, confirmed, qualified, unsubscribed)
-        let mut by_country: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
-        // source: (total, confirmed, qualified)
-        let mut by_source: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        // country: (qualified, unsubscribed); only self-reported outcomes.
+        let mut by_country: HashMap<String, (u64, u64)> = HashMap::new();
+        // source: (cycles_started, qualified)
+        let mut by_source: HashMap<String, (u64, u64)> = HashMap::new();
         let mut by_notice_version: HashMap<String, u64> = HashMap::new();
         let mut by_domain: HashMap<String, u64> = HashMap::new();
         // Estimated signup country resolved from the stored IP (db-ip lookup);
         // this is NOT the self-reported residence.
         let mut estimated_by_country: HashMap<String, u64> = HashMap::new();
-        // UTC day -> (signups, confirmations, qualifications)
-        let mut daily: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        // UTC day -> (cycles_started, qualifications)
+        let mut daily: HashMap<String, (u64, u64)> = HashMap::new();
 
         for entry in self.db.iter().flatten() {
             if let Ok(sub) = serde_json::from_slice::<Subscriber>(&entry.1) {
                 total += 1;
 
-                if sub.confirmed {
-                    confirmed += 1;
-                }
+                // Mutually exclusive latest-action buckets: an unsubscribe is
+                // final for the current cycle, a completed code+country makes
+                // the address qualified, a live code keeps it pending.
+                let is_unsubscribed = sub.unsubscribed;
+                let is_qualified =
+                    !is_unsubscribed && sub.confirmed && !sub.country.is_empty();
+                let is_pending =
+                    !is_unsubscribed && !sub.confirmed && sub.code_expires > now_ts;
 
-                let is_qualified = sub.confirmed && !sub.country.is_empty();
+                if is_unsubscribed {
+                    unsubscribed += 1;
+                }
 
                 if is_qualified {
                     qualified += 1;
                 }
 
-                if sub.unsubscribed {
-                    unsubscribed += 1;
-                } else if sub.confirmed {
-                    active += 1;
-                }
-
-                // Still unconfirmed but inside its code lifetime: may convert yet.
-                if !sub.confirmed && sub.code_expires > now_ts {
+                if is_pending {
                     pending += 1;
                 }
 
@@ -570,18 +572,14 @@ impl Waitlist {
                     last30d += 1;
                 }
 
-                if sub.confirmed_at >= cut_7d {
-                    confirmed_last7d += 1;
-                }
-
                 if sub.country_at >= cut_7d {
                     qualified_last7d += 1;
                 }
 
                 code_attempts += u64::from(sub.attempts);
                 unique_ips.insert(sub.ip.clone());
-                // first/last signup = earliest-ever / most recent CYCLE start;
-                // a resubscribe moves last_signup_at forward.
+                // first/last cycle = earliest-ever / most recent cycle start;
+                // a resubscribe moves last_cycle_started_at forward.
                 first_ts = first_ts.min(if sub.created_ts > 0 { sub.created_ts } else { sub.ts });
                 last_ts = last_ts.max(start_ts);
 
@@ -590,19 +588,19 @@ impl Waitlist {
                 } else {
                     sub.country.clone()
                 };
-                let country_entry = by_country.entry(country_key).or_insert((0, 0, 0, 0));
-                country_entry.0 += 1;
+                // Only self-reported outcomes land in by_country: a stalled
+                // address may never have reported a country at all, and an
+                // all-zero bucket for it would be noise.
+                if is_qualified || is_unsubscribed {
+                    let country_entry = by_country.entry(country_key).or_insert((0, 0));
 
-                if sub.confirmed {
-                    country_entry.1 += 1;
-                }
+                    if is_qualified {
+                        country_entry.0 += 1;
+                    }
 
-                if is_qualified {
-                    country_entry.2 += 1;
-                }
-
-                if sub.unsubscribed {
-                    country_entry.3 += 1;
+                    if is_unsubscribed {
+                        country_entry.1 += 1;
+                    }
                 }
 
                 let source_key = if sub.source.is_empty() {
@@ -610,15 +608,13 @@ impl Waitlist {
                 } else {
                     sub.source.clone()
                 };
-                let source_entry = by_source.entry(source_key).or_insert((0, 0, 0));
-                source_entry.0 += 1;
-
-                if sub.confirmed {
-                    source_entry.1 += 1;
-                }
+                // Per-cycle sources are not stored, so every started cycle of
+                // an address is attributed to its current source.
+                let source_entry = by_source.entry(source_key).or_insert((0, 0));
+                source_entry.0 += sub.cycle.max(1) as u64;
 
                 if is_qualified {
-                    source_entry.2 += 1;
+                    source_entry.1 += 1;
                 }
 
                 *by_notice_version
@@ -642,22 +638,15 @@ impl Waitlist {
                 *estimated_by_country.entry(guessed).or_insert(0) += 1;
 
                 // Daily event counts within the 30-day window.
-                if sub.ts >= cut_30d {
-                    daily.entry(date_key(sub.ts)).or_insert((0, 0, 0)).0 += 1;
-                }
-
-                if sub.confirmed_at >= cut_30d {
-                    daily
-                        .entry(date_key(sub.confirmed_at))
-                        .or_insert((0, 0, 0))
-                        .1 += 1;
+                if start_ts >= cut_30d {
+                    daily.entry(date_key(start_ts)).or_insert((0, 0)).0 += 1;
                 }
 
                 if sub.country_at >= cut_30d {
                     daily
                         .entry(date_key(sub.country_at))
-                        .or_insert((0, 0, 0))
-                        .2 += 1;
+                        .or_insert((0, 0))
+                        .1 += 1;
                 }
             }
         }
@@ -666,58 +655,53 @@ impl Waitlist {
         let mut daily_series = serde_json::Map::new();
         for offset in (0..30).rev() {
             let key = date_key(now_ts - offset * 86_400);
-            let (signups, confirmed_day, qualified_day) =
-                daily.get(&key).copied().unwrap_or((0, 0, 0));
+            let (cycles_day, qualified_day) = daily.get(&key).copied().unwrap_or((0, 0));
             daily_series.insert(
                 key,
                 json!({
-                    "signups": signups,
-                    "confirmed": confirmed_day,
+                    "cycles_started": cycles_day,
                     "qualified": qualified_day
                 }),
             );
         }
 
+        // `incomplete` = started a cycle but stalled: live-code pendings are
+        // counted separately, so this is expired-code or legacy code-only.
+        let incomplete = total - qualified - pending - unsubscribed;
+
         json!({
             "generated_at": now_ts,
-            // Grain: "total"/"unique_email_addresses" count distinct addresses;
-            // cycle-level funnel counters below. See "definitions".
-            "total": total,
-            "email_confirmed": confirmed,
-            "unconfirmed": total - confirmed,
-            "unique_email_addresses": total,
-            "signup_cycles_total": self.cycles_total(),
-            "verification_email_sent": self.emails_sent(),
-            "signup_completed": qualified,
+            "addresses": {
+                "total": total,
+                "qualified": qualified,
+                "pending": pending,
+                "incomplete": incomplete,
+                "unsubscribed": unsubscribed
+            },
             "qualified": qualified,
-            "unsubscribed": unsubscribed,
-            "active": active,
-            "pending": pending,
-            "duplicates": self.duplicates(),
-            "code_attempts": code_attempts,
-            "unique_ips": unique_ips.len(),
-            "first_signup_at": if total > 0 { first_ts } else { 0 },
-            "last_signup_at": last_ts,
-            "last24h": last24h,
-            "last7d": last7d,
-            "last30d": last30d,
-            "confirmed_last7d": confirmed_last7d,
             "qualified_last7d": qualified_last7d,
+            "cycles_started_total": self.cycles_total(),
+            "cycles_started_last24h": last24h,
+            "cycles_started_last7d": last7d,
+            "cycles_started_last30d": last30d,
+            "first_cycle_started_at": if total > 0 { first_ts } else { 0 },
+            "last_cycle_started_at": last_ts,
+            "code_attempts": code_attempts,
+            "duplicates": self.duplicates(),
+            "unique_ips": unique_ips.len(),
+            "verification_email_sent": self.emails_sent(),
             "by_country": by_country.into_iter().map(|(k, v)| (k, json!({
-                "total": v.0,
-                "confirmed": v.1,
-                "qualified": v.2,
-                "unsubscribed": v.3
+                "qualified": v.0,
+                "unsubscribed": v.1
             }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-            "by_source": by_source.into_iter().map(|(k, v)| (k, json!({
-                "total": v.0,
-                "confirmed": v.1,
-                "qualified": v.2
-            }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-            "by_notice_version": by_notice_version,
             "by_domain": by_domain,
-            "estimated_by_country": estimated_by_country,
+            "by_notice_version": by_notice_version,
+            "by_source": by_source.into_iter().map(|(k, v)| (k, json!({
+                "cycles_started": v.0,
+                "qualified": v.1
+            }))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "daily": daily_series,
+            "estimated_by_country": estimated_by_country,
             "definitions": definitions()
         })
     }
@@ -742,36 +726,34 @@ fn date_key(ts: u64) -> String {
 /// consumers never have to guess grain, dedup rules, or time boundaries.
 fn definitions() -> serde_json::Value {
     json!({
-        "grain": "One record per distinct normalized email address. A signup CYCLE is one address's pending->confirmed (or unsubscribed) attempt: retries inside a cycle are idempotent, unsubscribe + resubscribe opens a new cycle on the same address.",
-        "total": "Distinct email addresses ever signed up (== unique_email_addresses). Does NOT grow on retries or resubscriptions.",
-        "unique_email_addresses": "Alias of total: distinct addresses, lower-cased. Only the aggregate count is returned, never the addresses.",
-        "signup_cycles_total": "Distinct signup cycles started: new addresses + resubscribes after unsubscribe. Retries inside a cycle never increment it.",
+        "grain": "One record per distinct normalized email address. A signup CYCLE is one address's pending->qualified (or unsubscribed) attempt: retries inside a cycle are idempotent, unsubscribe + resubscribe opens a new cycle on the same address.",
+        "addresses": "Mutually exclusive latest-action buckets over distinct addresses; addresses.total == addresses.qualified + addresses.pending + addresses.incomplete + addresses.unsubscribed.",
+        "addresses.total": "Distinct email addresses ever signed up. Does NOT grow on retries or resubscriptions.",
+        "addresses.qualified": "Addresses whose latest cycle completed with a valid code AND self-reported country together, and that have not unsubscribed since.",
+        "addresses.pending": "Addresses whose current code is still unverified and unexpired; they may still qualify.",
+        "addresses.incomplete": "Addresses that started a cycle but stalled: code expired unconfirmed, or legacy records confirmed without a country.",
+        "addresses.unsubscribed": "Addresses whose latest action was unsubscribe. History is kept; resubscribing opens a new cycle.",
+        "cycles_started_total": "Distinct signup cycles started: new addresses + resubscribes after unsubscribe. Retries inside a cycle never increment it.",
         "verification_email_sent": "Cycles whose verification email was accepted by the SMTP relay (counted once per cycle; suppressed in-cycle resends are not counted). This is SENT, not delivered or received.",
-        "email_confirmed": "Addresses that completed signup at least once (valid code verified). Cumulative current state.",
-        "signup_completed": "Alias of qualified: cycles accepted with a valid code AND country together in the final step.",
-        "qualified": "Alias of signup_completed (same counter, not an additional stage).",
-        "unconfirmed": "Addresses whose current cycle has not completed signup (total - email_confirmed).",
-        "active": "Addresses confirmed and not unsubscribed (current status).",
+        "qualified": "Top-level alias of addresses.qualified: the sole cycle-completion metric (code and country accepted together; no separate code-only stage).",
         "unsubscribed": "Addresses whose latest action was unsubscribe. History is kept; resubscribing opens a new cycle.",
-        "pending": "Unconfirmed addresses whose current code has not expired yet.",
-        "duplicates": "Join attempts for already-confirmed, active addresses (lifetime counter).",
+        "duplicates": "Join attempts for already-qualified, active addresses (lifetime counter).",
         "code_attempts": "Wrong code entries recorded during complete() (lifetime sum of per-address attempt counters).",
         "unique_ips": "Distinct signup IPs over all records (lifetime, no window).",
-        "last24h": "Cycles started in the rolling 24h before generated_at (anchored on cycle start; a resubscribe moves its cycle forward).",
-        "last7d": "Cycles started in the rolling 7 days before generated_at.",
-        "last30d": "Cycles started in the rolling 30 days before generated_at.",
-        "confirmed_last7d": "Cycles whose code was verified in the rolling 7 days before generated_at (confirmed_at).",
-        "qualified_last7d": "Cycles qualified (code + country) in the rolling 7 days before generated_at (country_at).",
-        "first_signup_at": "Earliest cycle-start timestamp over all addresses (Unix seconds, UTC).",
-        "last_signup_at": "Most recent cycle-start timestamp (Unix seconds, UTC); a resubscribe moves it forward.",
+        "cycles_started_last24h": "Cycles started in the rolling 24h before generated_at (anchored on cycle start; a resubscribe moves its cycle forward).",
+        "cycles_started_last7d": "Cycles started in the rolling 7 days before generated_at.",
+        "cycles_started_last30d": "Cycles started in the rolling 30 days before generated_at.",
+        "qualified_last7d": "Addresses qualified (code + country) in the rolling 7 days before generated_at (country_at).",
+        "first_cycle_started_at": "Earliest cycle-start timestamp over all addresses (Unix seconds, UTC).",
+        "last_cycle_started_at": "Most recent cycle-start timestamp (Unix seconds, UTC); a resubscribe moves it forward.",
         "generated_at": "When this snapshot was built (Unix seconds, UTC).",
-        "by_source": "Per lowercase utm_source of the CURRENT cycle: addresses (not cycles) with cumulative confirmed/qualified. Empty/invalid source -> direct_or_unattributed. Values are filtered to [a-z0-9_-] and length-capped; each new cycle is attributed to its own source.",
-        "by_country": "Self-reported country of residence per address: totals with confirmed/qualified/unsubscribed.",
+        "by_source": "Per lowercase utm_source of the CURRENT cycle: cycles_started counts every started cycle attributed to it, qualified counts current qualified addresses. Empty/invalid source -> direct_or_unattributed. Values are filtered to [a-z0-9_-] and length-capped.",
+        "by_country": "Self-reported country of residence, limited to qualified and unsubscribed addresses; pending/incomplete addresses may lack a self-reported country.",
         "by_domain": "Distinct addresses per email domain.",
         "by_notice_version": "Addresses per consent notice version shown at signup.",
         "estimated_by_country": "Addresses with a GeoIP-guessed country from the signup IP (heuristic, not self-reported).",
-        "daily": "UTC calendar days for the last 30 days: signups = cycles started that day; confirmed = codes verified that day (confirmed_at); qualified = code+country accepted that day (country_at). Buckets follow current record timestamps, so a resubscribed address re-enters the funnel; rolling-window fields may differ from calendar-day sums by design.",
-        "nesting": "signup_cycles_total >= verification_email_sent >= signup_completed (funnel stages, not additive totals). total == unique_email_addresses counts addresses, not cycles."
+        "daily": "UTC calendar days for the last 30 days: cycles_started = cycles started that day; qualified = code+country accepted that day (country_at). Buckets follow current record timestamps, so a resubscribed address re-enters the funnel; rolling-window fields may differ from calendar-day sums by design.",
+        "nesting": "cycles_started_total >= verification_email_sent >= qualified (funnel stages, not additive totals). addresses.* buckets are mutually exclusive and sum to addresses.total."
     })
 }
 
@@ -875,7 +857,7 @@ mod tests {
 
         let stats = wl.stats();
         assert_eq!(stats["duplicates"], 1);
-        assert_eq!(stats["email_confirmed"], 1);
+        assert_eq!(stats["addresses"]["qualified"], 1);
         assert_eq!(stats["qualified"], 1);
     }
 
@@ -956,11 +938,9 @@ mod tests {
         // Address-level total is unchanged; funnel counters stay nested.
         let addresses = wl.db.len() as u64;
         let stats = wl.stats();
-        assert_eq!(stats["total"], addresses);
-        assert_eq!(stats["unique_email_addresses"], stats["total"]);
-        assert_eq!(stats["signup_cycles_total"], 2);
-        assert_eq!(stats["email_confirmed"], 0); // reset on resubscribe
-        assert_eq!(stats["signup_completed"], stats["qualified"]);
+        assert_eq!(stats["addresses"]["total"], addresses);
+        assert_eq!(stats["cycles_started_total"], 2);
+        assert_eq!(stats["addresses"]["qualified"], 0); // reset on resubscribe
 
         // New cycle's send is counted once, not twice.
         assert!(wl.mark_email_sent(email));
@@ -973,16 +953,16 @@ mod tests {
         assert!(code3.is_empty());
         assert_eq!(wl.cycles_total(), 2);
 
-        // The abandoned first cycle must not leave a phantom confirmation
+        // The abandoned first cycle must not leave a phantom completion
         // in the daily buckets (aggregate vs daily reconciliation).
         let stats2 = wl.stats();
-        let daily_confirmed: u64 = stats2["daily"]
+        let daily_qualified: u64 = stats2["daily"]
             .as_object()
             .unwrap()
             .values()
-            .map(|d| d["confirmed"].as_u64().unwrap())
+            .map(|d| d["qualified"].as_u64().unwrap())
             .sum();
-        assert_eq!(daily_confirmed, 0);
+        assert_eq!(daily_qualified, 0);
     }
 
     #[test]
@@ -1036,33 +1016,28 @@ mod tests {
 
         let stats = wl.stats();
 
-        assert_eq!(stats["total"], 2);
-        assert_eq!(stats["email_confirmed"], 1);
-        assert_eq!(stats["unconfirmed"], 1);
+        assert_eq!(stats["addresses"]["total"], 2);
+        assert_eq!(stats["addresses"]["qualified"], 1);
+        assert_eq!(stats["addresses"]["pending"], 1);
+        assert_eq!(stats["addresses"]["incomplete"], 0);
+        assert_eq!(stats["addresses"]["unsubscribed"], 0);
         assert_eq!(stats["qualified"], 1);
-        assert_eq!(stats["unsubscribed"], 0);
-        assert_eq!(stats["active"], 1);
-        assert_eq!(stats["pending"], 1);
-        assert_eq!(stats["last24h"], 2);
-        assert_eq!(stats["last7d"], 2);
-        assert_eq!(stats["last30d"], 2);
-        assert_eq!(stats["confirmed_last7d"], 1);
+        assert_eq!(stats["cycles_started_last24h"], 2);
+        assert_eq!(stats["cycles_started_last7d"], 2);
+        assert_eq!(stats["cycles_started_last30d"], 2);
         assert_eq!(stats["qualified_last7d"], 1);
         assert_eq!(stats["unique_ips"], 2);
-        assert!(stats["first_signup_at"].as_u64().unwrap() > 0);
-        assert!(stats["last_signup_at"].as_u64().unwrap() > 0);
+        assert!(stats["first_cycle_started_at"].as_u64().unwrap() > 0);
+        assert!(stats["last_cycle_started_at"].as_u64().unwrap() > 0);
 
         let us = &stats["by_country"]["US"];
-        assert_eq!(us["total"], 1);
-        assert_eq!(us["confirmed"], 1);
         assert_eq!(us["qualified"], 1);
         assert_eq!(us["unsubscribed"], 0);
-        assert_eq!(stats["by_country"]["unknown"]["total"], 1);
+        assert_eq!(stats["by_country"].get("unknown"), None);
 
-        assert_eq!(stats["by_source"]["linkedin"]["total"], 1);
-        assert_eq!(stats["by_source"]["linkedin"]["confirmed"], 1);
+        assert_eq!(stats["by_source"]["linkedin"]["cycles_started"], 1);
         assert_eq!(stats["by_source"]["linkedin"]["qualified"], 1);
-        assert_eq!(stats["by_source"]["direct_or_unattributed"]["total"], 1);
+        assert_eq!(stats["by_source"]["direct_or_unattributed"]["cycles_started"], 1);
 
         assert_eq!(stats["by_domain"]["test.io"], 2);
         assert_eq!(stats["by_notice_version"].as_object().unwrap().len(), 1);
@@ -1079,8 +1054,7 @@ mod tests {
         let daily = stats["daily"].as_object().unwrap();
         assert_eq!(daily.len(), 30);
         let today = daily.get(&date_key(now())).unwrap();
-        assert_eq!(today["signups"], 2);
-        assert_eq!(today["confirmed"], 1);
+        assert_eq!(today["cycles_started"], 2);
         assert_eq!(today["qualified"], 1);
     }
 }

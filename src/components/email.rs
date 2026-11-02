@@ -71,7 +71,7 @@ impl Emailer {
     /// Send the verification code. Returns true only when the message was
     /// accepted by the SMTP relay (i.e. a real send — delivery/receipt is
     /// not tracked and is a separate concern).
-    pub async fn send_code(&self, to: &str, code: &str) -> bool {
+    pub async fn send_link(&self, to: &str, url: &str) -> bool {
         let Some(mailer) = &self.mailer else {
             return false;
         };
@@ -87,10 +87,10 @@ impl Emailer {
         let email = match Message::builder()
             .from(self.from.clone())
             .to(to_mailbox)
-            .subject("Your Bearby confirmation code")
+            .subject("Confirm your Bearby Card subscription")
             .multipart(MultiPart::alternative_plain_html(
-                code_plain(code),
-                code_html(code),
+                link_plain(url),
+                link_html(url),
             )) {
             Ok(e) => e,
             Err(e) => {
@@ -101,7 +101,7 @@ impl Emailer {
 
         match mailer.send(email).await {
             Ok(_) => {
-                info!("SMTP: code sent to {to}");
+                info!("SMTP: confirmation link sent to {to}");
                 true
             }
             Err(e) => {
@@ -146,7 +146,7 @@ impl Emailer {
     }
 }
 
-fn code_html(code: &str) -> String {
+fn link_html(url: &str) -> String {
     format!(
         r#"<!doctype html>
 <html><body style="margin:0;padding:0;background:#0b0910;font-family:Arial,Helvetica,sans-serif;">
@@ -155,20 +155,21 @@ fn code_html(code: &str) -> String {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#17131f;border:1px solid #2a2338;border-radius:16px;padding:40px;">
 <tr><td style="color:#ac59ff;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">Bearby Card</td></tr>
 <tr><td style="color:#ffffff;font-size:24px;font-weight:bold;padding:14px 0 8px;">Confirm your email</td></tr>
-<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:24px;">Enter this code on the website to finish joining the waitlist. The code is valid for 15 minutes.</td></tr>
-<tr><td align="center" style="padding:8px 0 24px;"><div style="display:inline-block;padding:18px 28px;background:#221c30;border:1px solid #ac59ff;border-radius:12px;"><span style="font-family:'Courier New',Courier,monospace;font-size:32px;font-weight:bold;letter-spacing:10px;color:#ffffff;">{code}</span></div></td></tr>
+<tr><td style="color:#a89fb8;font-size:15px;line-height:1.6;padding-bottom:24px;">Click the button below to finish joining the waitlist. The link is valid for 15 minutes.</td></tr>
+<tr><td align="center" style="padding:8px 0 24px;"><a href="{url}" style="display:inline-block;padding:16px 36px;background:#ac59ff;border-radius:12px;text-decoration:none;"><span style="font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:bold;color:#ffffff;">Confirm subscription</span></a></td></tr>
+<tr><td style="color:#a89fb8;font-size:13px;line-height:1.6;padding-top:6px;">Button not working? Paste this link into your browser:<br><a href="{url}" style="color:#ac59ff;word-break:break-all;">{url}</a></td></tr>
 <tr><td style="color:#6f6880;font-size:13px;padding-top:18px;">If you didn&apos;t request this, just ignore this email.</td></tr>
 </table>
 </td></tr>
 </table>
 </body></html>"#,
-        code = code
+        url = url
     )
 }
 
-fn code_plain(code: &str) -> String {
+fn link_plain(url: &str) -> String {
     format!(
-        "Your Bearby confirmation code: {code}\n\nEnter this code on the website to finish joining the waitlist. The code is valid for 15 minutes.\n\nIf you didn't request this, just ignore this email.\n"
+        "Confirm your Bearby Card subscription:\n\n{url}\n\nOpen this link to finish joining the waitlist. The link is valid for 15 minutes.\n\nIf you didn't request this, just ignore this email.\n"
     )
 }
 
@@ -206,14 +207,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn code_html_renders_code_as_single_run() {
-        let html = code_html("123456");
-        assert!(html.contains(">123456</span>"));
-        assert!(!html.contains("min-width:52px"));
+    fn link_html_renders_url_as_href_and_text() {
+        let url = "https://bearby.io/waitlist/confirmed?email=a%40b.co&code=123456";
+        let html = link_html(url);
+        assert!(html.contains(&format!("href=\"{url}\"")));
+        assert!(html.contains("Confirm subscription"));
     }
 
     #[test]
-    fn code_plain_contains_code() {
-        assert!(code_plain("123456").contains("123456"));
+    fn link_plain_contains_url() {
+        let url = "https://bearby.io/waitlist/confirmed?email=a%40b.co&code=123456";
+        assert!(link_plain(url).contains(url));
     }
 }

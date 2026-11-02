@@ -165,7 +165,15 @@ pub async fn handle_join(
 
     if !code.is_empty() {
         // Count each signup cycle's verification email once, on SMTP success.
-        if emailer.send_code(&email, &code).await {
+        let confirm_url = format!(
+            "{}/waitlist/confirmed?{}",
+            site_url(),
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("email", &email)
+                .append_pair("code", &code)
+                .finish()
+        );
+        if emailer.send_link(&email, &confirm_url).await {
             waitlist.mark_email_sent(&email);
         }
     }

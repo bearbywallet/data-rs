@@ -286,6 +286,58 @@ pub async fn handle_complete(
     }
 }
 
+/// GET /api/v1/waitlist/check — non-consuming validity probe used by the
+/// confirmation page on load: shows the country form only while the emailed
+/// link is still live, otherwise an "invalid link" screen. Unlike the legacy
+/// GET confirm it never confirms anything and never burns attempts.
+pub async fn handle_check(
+    req: Request<hyper::body::Incoming>,
+    waitlist: Arc<Waitlist>,
+    peer: String,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if waitlist.rate_limit(visitor_ip(&req, &peer)).is_err() {
+        return json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -6, "message": "Too many requests" }),
+        );
+    }
+
+    let query = req.uri().query().unwrap_or_default();
+    let pairs: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let email = normalize_email(pairs.get("email").map(String::as_str).unwrap_or_default());
+    let code = pairs
+        .get("code")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+
+    if !valid_email(&email) || code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return incorrect_params();
+    }
+
+    match waitlist.check(&email, code) {
+        ConfirmStatus::Confirmed => {
+            json_res(StatusCode::OK, json!({ "code": 0, "message": "link valid" }))
+        }
+        ConfirmStatus::AlreadyConfirmed => json_res(
+            StatusCode::GONE,
+            json!({ "code": -12, "message": "Confirmation link already used" }),
+        ),
+        ConfirmStatus::WrongCode => json_res(
+            StatusCode::FORBIDDEN,
+            json!({ "code": -7, "message": "Wrong code" }),
+        ),
+        ConfirmStatus::Expired => json_res(
+            StatusCode::GONE,
+            json!({ "code": -8, "message": "Code expired" }),
+        ),
+        ConfirmStatus::TooManyAttempts | ConfirmStatus::NotFound => incorrect_params(),
+    }
+}
+
 /// Legacy GET confirm kept for links/clients from before the country step;
 /// new clients use POST /complete. Confirms without country (record stays
 /// unqualified until the user completes the country step on the website).

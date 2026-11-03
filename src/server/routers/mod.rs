@@ -36,6 +36,9 @@ pub async fn route(
         (&hyper::Method::GET, "/api/v1/waitlist/confirm") => {
             waitlist::handle_confirm(req, waitlist, emailer).await
         }
+        (&hyper::Method::GET, "/api/v1/waitlist/check") => {
+            waitlist::handle_check(req, waitlist, peer).await
+        }
         (&hyper::Method::POST, "/api/v1/waitlist/unsubscribe") => {
             waitlist::handle_unsubscribe_token(req, waitlist, peer).await
         }

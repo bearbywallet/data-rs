@@ -60,6 +60,16 @@ fn incorrect_params() -> Result<Response<Full<Bytes>>, hyper::Error> {
     )
 }
 
+/// The emailed link points at no known subscriber (deleted record, tampered
+/// email/code, unsupported legacy client). Distinct from -2 so the website
+/// can show an "invalid link" screen instead of a form-validation error.
+fn unknown_link() -> Result<Response<Full<Bytes>>, hyper::Error> {
+    json_res(
+        StatusCode::NOT_FOUND,
+        json!({ "code": -13, "message": "Invalid or unknown confirmation link" }),
+    )
+}
+
 /// Resolves the visitor IP: direct socket peer; behind relayd it is 127.0.0.1 —
 /// then take the real client from X-Forwarded-For (relayd injects $REMOTE_ADDR).
 fn visitor_ip(req: &Request<hyper::body::Incoming>, peer: &str) -> IpAddr {
@@ -282,7 +292,7 @@ pub async fn handle_complete(
             StatusCode::TOO_MANY_REQUESTS,
             json!({ "code": -9, "message": "Too many attempts" }),
         ),
-        ConfirmStatus::NotFound => incorrect_params(),
+        ConfirmStatus::NotFound => unknown_link(),
     }
 }
 
@@ -318,10 +328,16 @@ pub async fn handle_check(
         return incorrect_params();
     }
 
-    match waitlist.check(&email, code) {
-        ConfirmStatus::Confirmed => {
-            json_res(StatusCode::OK, json!({ "code": 0, "message": "link valid" }))
-        }
+    let (status, expires_in) = waitlist.check(&email, code);
+    match status {
+        ConfirmStatus::Confirmed => json_res(
+            StatusCode::OK,
+            json!({
+                "code": 0,
+                "message": "link valid",
+                "expires_in": expires_in,
+            }),
+        ),
         ConfirmStatus::AlreadyConfirmed => json_res(
             StatusCode::GONE,
             json!({ "code": -12, "message": "Confirmation link already used" }),
@@ -334,7 +350,11 @@ pub async fn handle_check(
             StatusCode::GONE,
             json!({ "code": -8, "message": "Code expired" }),
         ),
-        ConfirmStatus::TooManyAttempts | ConfirmStatus::NotFound => incorrect_params(),
+        ConfirmStatus::TooManyAttempts => json_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "code": -9, "message": "Too many attempts" }),
+        ),
+        ConfirmStatus::NotFound => unknown_link(),
     }
 }
 
@@ -395,7 +415,7 @@ pub async fn handle_confirm(
             StatusCode::TOO_MANY_REQUESTS,
             json!({ "code": -9, "message": "Too many attempts" }),
         ),
-        ConfirmStatus::NotFound => incorrect_params(),
+        ConfirmStatus::NotFound => unknown_link(),
     }
 }
 

@@ -338,30 +338,31 @@ impl Waitlist {
     /// Non-consuming validity probe for the confirmation page: the website
     /// calls this on page load to decide between the country form and an
     /// "invalid link" screen. Unlike `complete` it never inserts a record,
-    /// never bumps `attempts` and never clears the code.
-    pub fn check(&self, email: &str, code: &str) -> ConfirmStatus {
+    /// never bumps `attempts` and never clears the code. Returns the status
+    /// plus the seconds left before the code expires (0 unless `Confirmed`).
+    pub fn check(&self, email: &str, code: &str) -> (ConfirmStatus, u64) {
         let bytes = match self.db.get(email) {
             Ok(Some(b)) => b,
-            _ => return ConfirmStatus::NotFound,
+            _ => return (ConfirmStatus::NotFound, 0),
         };
         let sub: Subscriber = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
-            Err(_) => return ConfirmStatus::NotFound,
+            Err(_) => return (ConfirmStatus::NotFound, 0),
         };
 
         if sub.confirmed {
-            return ConfirmStatus::AlreadyConfirmed;
+            return (ConfirmStatus::AlreadyConfirmed, 0);
         }
         if !sub.code.is_empty() && sub.code != code {
-            return ConfirmStatus::WrongCode;
+            return (ConfirmStatus::WrongCode, 0);
         }
 
         let ts = now();
         if sub.code.is_empty() || ts >= sub.code_expires {
-            return ConfirmStatus::Expired;
+            return (ConfirmStatus::Expired, 0);
         }
 
-        ConfirmStatus::Confirmed
+        (ConfirmStatus::Confirmed, sub.code_expires - ts)
     }
 
     /// Verify the emailed code AND the required country of residence. Only a
@@ -892,11 +893,15 @@ mod tests {
         assert_eq!(status, JoinStatus::Created);
 
         // Page-load probes must not consume the link: completion still works.
-        assert_eq!(wl.check(email, &code), ConfirmStatus::Confirmed);
+        let (probed, ttl) = wl.check(email, &code);
+        assert_eq!(probed, ConfirmStatus::Confirmed);
+        assert!(ttl > 0 && ttl <= super::WAITLIST_CODE_TTL_SECS);
         assert_eq!(wl.complete(email, &code, "US"), ConfirmStatus::Confirmed);
 
         // After completion the probe reports the link as used, not valid.
-        assert_eq!(wl.check(email, &code), ConfirmStatus::AlreadyConfirmed);
+        let (probed, ttl) = wl.check(email, &code);
+        assert_eq!(probed, ConfirmStatus::AlreadyConfirmed);
+        assert_eq!(ttl, 0);
     }
 
     #[test]

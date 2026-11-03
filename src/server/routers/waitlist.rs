@@ -262,8 +262,13 @@ pub async fn handle_complete(
 
             json_res(StatusCode::OK, json!({ "code": 0, "message": "qualified" }))
         }
+        // One-shot link: once confirmed the code is wiped, so replaying the
+        // emailed link must fail instead of returning success again.
         ConfirmStatus::AlreadyConfirmed => {
-            json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
+            json_res(
+                StatusCode::GONE,
+                json!({ "code": -12, "message": "Confirmation link already used" }),
+            )
         }
         ConfirmStatus::WrongCode => json_res(
             StatusCode::FORBIDDEN,
@@ -321,7 +326,10 @@ pub async fn handle_confirm(
             json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
         }
         ConfirmStatus::AlreadyConfirmed => {
-            json_res(StatusCode::OK, json!({ "code": 0, "message": "confirmed" }))
+            json_res(
+                StatusCode::GONE,
+                json!({ "code": -12, "message": "Confirmation link already used" }),
+            )
         }
         ConfirmStatus::WrongCode => json_res(
             StatusCode::FORBIDDEN,
